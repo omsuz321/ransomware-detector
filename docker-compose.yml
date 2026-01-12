@@ -1,0 +1,20 @@
+services:
+  lsm-dev-2404:
+    build:
+      context: .              # Sicherer: Definiert genau, wo der Build startet
+      dockerfile: Dockerfile
+    image: lsm-dev-image-2404
+    container_name: lsm-dev-2404
+    
+    volumes:
+      - ./:/work
+      # EMPFOHLEN: Speichert VS Code Extensions & Server zwischen
+      # Damit musst du nicht bei jedem Neustart warten.
+      - vscode-server:/root/.vscode-server 
+    
+    stdin_open: true
+    tty: true
+
+# Das hier unten muss dazu, wenn du das Volume oben nutzt!
+volumes:
+  vscode-server:

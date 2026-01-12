@@ -1,0 +1,47 @@
+{
+	"name": "LSM Kernel Dev (Ubuntu 24.04)",
+	
+	// Wir nutzen deine existierende Docker-Compose Datei
+	"dockerComposeFile": "../docker-compose.yml",
+	
+	// Der Service-Name muss exakt mit dem in docker-compose.yml übereinstimmen!
+	"service": "lsm-dev-2404",
+	
+	// Das Arbeitsverzeichnis im Container
+	"workspaceFolder": "/work",
+
+	// Einstellungen für VS Code im Container
+	"customizations": {
+		"vscode": {
+			// Extensions, die automatisch installiert werden sollen
+			"extensions": [
+				"llvm-vs-code-extensions.vscode-clangd", // Wichtig für dich!
+				"ms-vscode.cpptools",                    // Für Debugging nötig
+				"ms-azuretools.vscode-docker",
+				"eamodio.gitlens"                        // Optional: Super für Git
+			],
+			// VS Code Settings (speziell für Clangd optimiert)
+			"settings": {
+				// Deaktiviert Microsoft IntelliSense zugunsten von Clangd
+				"C_Cpp.intelliSenseEngine": "disabled",
+				// Zeigt Clangd den Pfad zur compile_commands.json (wird im Kernel-Root liegen)
+				// WICHTIG: Wenn dein Kernel-Ordner anders heißt, pfad hier anpassen!
+				"clangd.arguments": [
+					"--background-index",
+					"--compile-commands-dir=/work/linux-6.8.0" 
+				],
+				"files.exclude": {
+					"**/.git": true,
+					"**/.DS_Store": true
+				}
+			}
+		}
+	},
+
+	// Wir arbeiten als Root, um Probleme mit Kernel-Files zu vermeiden
+	"remoteUser": "root"
+
+	// Optional: Befehl, der NACH dem Erstellen einmal läuft.
+	// Hier könnten wir theoretisch den Kernel laden, aber manuell ist sicherer beim ersten Mal.
+	// "postCreateCommand": "apt source linux" 
+}
