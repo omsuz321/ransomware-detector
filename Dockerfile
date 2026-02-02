@@ -2,7 +2,7 @@ FROM ubuntu:noble
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Sources aktivieren & Tools installieren (wie vorher) + clang/clangd
+# 1. Sources aktivieren & Tools installieren + clang/clangd + eBPF-Tools
 RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources && \
     apt-get update && apt-get install -y \
         build-essential \
@@ -23,19 +23,21 @@ RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.s
         clang \
         clangd \
         gdb \
+        linux-tools-generic \
+        libbpf-dev \
+        llvm \
     && rm -rf /var/lib/apt/lists/*
 
 # Kernel-Build-Dependencies
 RUN apt-get update && apt-get build-dep -y linux && rm -rf /var/lib/apt/lists/*
 
-# 2. Cache-Ordner für Kernel-Sourcen
-WORKDIR /kernel-cache
+# bpftool verfügbar machen (linux-tools-generic installiert es kernel-version-spezifisch)
+RUN ln -sf /usr/lib/linux-tools/*-generic/bpftool /usr/local/bin/bpftool || \
+    (apt-get update && apt-get install -y bpftool && rm -rf /var/lib/apt/lists/*)
 
-# 3. Kernel-Sourcen ins Image holen
-RUN apt-get update && apt source linux && rm -rf /var/lib/apt/lists/*
-
-# 4. Arbeitsverzeichnis für deine Arbeit
+# Arbeitsverzeichnis für deine Arbeit
 WORKDIR /work
 
-# 5. Start-CMD: Kernel aus Cache nach /work kopieren (ohne zu überschreiben), dann Shell
-CMD ["sh", "-c", "cp -rn /kernel-cache/* /work/ && /bin/bash"]
+# Start-CMD: Shell
+CMD ["/bin/bash"]
+

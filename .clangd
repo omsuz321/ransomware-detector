@@ -1,0 +1,20 @@
+CompileFlags:
+  Add:
+    - --compile-commands-dir=/work/security/my_lsm
+    - -I/work/security/my_lsm/include
+    - -I/work/include
+    - -I/work/linux-6.14.0/include
+    - -I/work/linux-6.14.0/include/uapi
+    - -I/work/linux-6.14.0/arch/x86/include
+    - -I/work/linux-6.14.0/arch/x86/include/generated
+    - -I/work/linux-6.14.0/arch/x86/include/generated/uapi
+    - -I/usr/include/bpf
+    - -D__TARGET_ARCH_x86
+    - -D__BPF__
+    - -target
+    - bpf
+    - -Wall
+    - -Wextra
+    - -Wsign-compare      
+    - -Wconversion        
+    - -Wshorten-64-to-32  

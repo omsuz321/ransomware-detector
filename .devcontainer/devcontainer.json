@@ -26,10 +26,19 @@
 				"C_Cpp.intelliSenseEngine": "disabled",
 				// Zeigt Clangd den Pfad zur compile_commands.json (wird im Kernel-Root liegen)
 				// WICHTIG: Wenn dein Kernel-Ordner anders heißt, pfad hier anpassen!
+				
 				"clangd.arguments": [
 					"--background-index",
-					"--compile-commands-dir=/work/linux-6.8.0" 
-				],
+					"--compile-commands-dir=/work/linux-6.14.0",
+					"--header-insertion=iwyu",
+					"-I/work/linux-6.14.0/include",
+					"-I/work/linux-6.14.0/include/uapi",
+					"-I/work/linux-6.14.0/arch/x86/include",
+					"-I/work/linux-6.14.0/arch/x86/include/generated",
+					"-I/work/linux-6.14.0/arch/x86/include/generated/uapi",
+					"-I/usr/include/bpf"
+				]
+				,
 				"files.exclude": {
 					"**/.git": true,
 					"**/.DS_Store": true
@@ -39,9 +48,8 @@
 	},
 
 	// Wir arbeiten als Root, um Probleme mit Kernel-Files zu vermeiden
-	"remoteUser": "root"
+	"remoteUser": "root",
 
-	// Optional: Befehl, der NACH dem Erstellen einmal läuft.
-	// Hier könnten wir theoretisch den Kernel laden, aber manuell ist sicherer beim ersten Mal.
-	// "postCreateCommand": "apt source linux" 
+	// Automatisch vmlinux.h, .clangd und Kernel-Source beim Start einrichten
+	"postCreateCommand": "bash /work/.devcontainer/setup.sh"
 }
