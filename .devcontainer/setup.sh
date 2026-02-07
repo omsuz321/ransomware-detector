@@ -22,16 +22,16 @@ fi
 
 # 2. .clangd
 echo "[2/4] Generiere .clangd..."
-cat > /work/.clangd << 'EOF'
+cat > /work/.clangd << EOF
 CompileFlags:
   Add:
     # Kernel-Includes (für vmlinux.h und Kernel-Strukturen)
-    - --compile-commands-dir=/work/linux-$KERNEL_VERSION
-    - -I/work/linux-$KERNEL_VERSION/include
-    - -I/work/linux-$KERNEL_VERSION/include/uapi
-    - -I/work/linux-$KERNEL_VERSION/arch/x86/include
-    - -I/work/linux-$KERNEL_VERSION/arch/x86/include/generated
-    - -I/work/linux-$KERNEL_VERSION/arch/x86/include/generated/uapi
+    - --compile-commands-dir=/work/linux-${KERNEL_VERSION}
+    - -I/work/linux-${KERNEL_VERSION}/include
+    - -I/work/linux-${KERNEL_VERSION}/include/uapi
+    - -I/work/linux-${KERNEL_VERSION}/arch/x86/include
+    - -I/work/linux-${KERNEL_VERSION}/arch/x86/include/generated
+    - -I/work/linux-${KERNEL_VERSION}/arch/x86/include/generated/uapi
     
     # BPF-Includes und Flags
     - -I/work/include

@@ -11,20 +11,23 @@
 #include "flag.h"
 #endif
 
-    #ifndef __COMMON_H
-    #include "common.h"
-    #endif 
+#ifndef __COMMON_H
+#include "common.h"
+#endif 
 
-    #ifndef __BPF_DFP_H__
-    #include "dfp.h"
-    #endif
+#ifndef __BPF_DFP_H__
+#include "dfp.h"
+#endif
 
 #if STANDALONE
     #ifndef __COMPAT_H__
     #include "compat.h"
     #endif
 #else
-
+    #ifndef __VMLINUX_H__
+    #include <vmlinux.h>
+    #endif
+    
     #ifndef __BPF_HELPERS_
     #include <bpf/bpf_helpers.h>
     #endif
@@ -32,21 +35,14 @@
 #endif
 
 
-
 /**
- * entropy_sum_callback_reset - Berechnet UND LÖSCHT DEN EINTRAG
+ * entropy_sum_callback - Berechnet den Summanden für Entropie, ohne Reset
  */
 static long entropy_sum_callback(__u32 i, struct entropy_ctx *ctx)
 {
     if (i >= MAX_BYTE_VALUES) return 0;
     
     __u32 count = (__u32)ctx->table->counts[i];
-    
-    // ====================================================
-    // RESET ZU 0 (Clear-on-Read)
-    // ====================================================
-    ctx->table->counts[i] = 0;
-
     if (count == 0) return 0;
 
     // Fixed-Point Berechnungen
@@ -58,10 +54,23 @@ static long entropy_sum_callback(__u32 i, struct entropy_ctx *ctx)
     return 0;
 }
 
+static long entropy_sum_and_reset_count_callback(__u32 i, struct entropy_ctx *ctx)
+{   
+    if (i >= MAX_BYTE_VALUES)
+        return 0;
+    
+    entropy_sum_callback(i, ctx);        
+    ctx->table->counts[i] = 0;
+    return 0;
+}
 /**
- * calculate_entropy - Berechnet Shannon-Entropie, speichert sie und setzt Tabelle zurück
+ * calculate_entropy - Berechnet Shannon-Entropie, lässt Tabelle unverändert
  */
-static __always_inline void calculate_entropy(struct freq_table *table, __u32 total_len, struct fixed_point *out_result)
+static __always_inline void calculate_entropy(
+    struct freq_table *table,
+    __u32 total_len, 
+    struct fixed_point *out_result,
+    int reset)
 {
     if (total_len == 0) {
         out_result->number = 0;
@@ -73,9 +82,11 @@ static __always_inline void calculate_entropy(struct freq_table *table, __u32 to
         .table = table,
         .sum_result = {0, 0}
     };
-    
-    // Loop führt jetzt Berechnung UND Reset durch
-    bpf_loop(MAX_BYTE_VALUES, (void* )entropy_sum_callback, &ctx, 0);
+
+    void* cb = (void*) (reset ? entropy_sum_and_reset_count_callback : entropy_sum_callback);
+    bpf_loop(MAX_BYTE_VALUES, cb, &ctx, 0);    
+
+
 
     // Formel anwendens
     struct fixed_point N_fp = to_fixed_point((__s32)total_len, 0);
@@ -84,5 +95,5 @@ static __always_inline void calculate_entropy(struct freq_table *table, __u32 to
     
     *out_result = subtract(&log_N, &term2);
 }
-
 #endif /*  */
+

@@ -2,39 +2,15 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-
-// 1. Compat Layer
-#include "../include/compat.h"
 
 // 2. Deine Bibliotheken
 #include "../include/common.h"
 #include "../include/dfp.h"
 #include "../include/entropy.h"
 
-// ============================================================
-// HILFSFUNKTIONEN
-// ============================================================
+#include "print_human_readable.h"
 
-void run_test_header(const char* title) {
-    printf("\n------------------------------------------------\n");
-    printf("  %s\n", title);
-    printf("------------------------------------------------\n");
-}
 
-void assert_fixed(const char* name, struct fixed_point res, const char* expected_desc) {
-    __s32 integer_part = res.number >> res.q;
-    __s32 mask = (1 << res.q) - 1;
-    __s32 fractional_bits = res.number & mask;
-    
-    // Anzeige auf 3 Dezimalstellen
-    __s64 frac_calc = (__s64)fractional_bits * 1000;
-    __s32 decimal_part = (__s32)(frac_calc >> res.q);
-    if (decimal_part < 0) decimal_part = -decimal_part;
-
-    printf("[TEST] %-28s -> Got: %3d.%03d  | Expected: %s\n", 
-           name, integer_part, decimal_part, expected_desc);
-}
 
 // ============================================================
 // MAIN TEST RUNNER
@@ -72,7 +48,7 @@ int main(void)
     memset(&table, 0, sizeof(table)); 
     table.counts[0] = 100; // 100x Byte 0x00
     
-    calculate_entropy(&table, 100, &entropy);
+    calculate_entropy(&table, 100, &entropy, 1);
     assert_fixed("Min Entropy (All Zeros)", entropy, "0.000 bits");
     
     // RESET-CHECK: Ist die Tabelle sauber für den nächsten Test?
@@ -89,7 +65,7 @@ int main(void)
         table.counts[i] = 1; // Jedes Byte 1x
     }
     
-    calculate_entropy(&table, 256, &entropy);
+    calculate_entropy(&table, 256, &entropy, 1);
     assert_fixed("Max Entropy (Uniform 256)", entropy, "8.000 bits");
 
 
@@ -100,7 +76,7 @@ int main(void)
     table.counts[0x00] = 50;
     table.counts[0xFF] = 50;
     
-    calculate_entropy(&table, 100, &entropy);
+    calculate_entropy(&table, 100, &entropy, 1);
     assert_fixed("Binary (0x00/0xFF)", entropy, "1.000 bits");
 
 
@@ -112,7 +88,7 @@ int main(void)
     table.counts['a'] = 25; table.counts['b'] = 25;
     table.counts['c'] = 25; table.counts['d'] = 25;
     
-    calculate_entropy(&table, 100, &entropy);
+    calculate_entropy(&table, 100, &entropy, 1);
     assert_fixed("ASCII Subset (4 chars)", entropy, "2.000 bits");
 
 
@@ -124,14 +100,14 @@ int main(void)
     table.counts[0] = 99;
     table.counts[1] = 1;
     
-    calculate_entropy(&table, 100, &entropy);
+    calculate_entropy(&table, 100, &entropy, 1);
     assert_fixed("Skewed (Padding)", entropy, "0.081 bits");
 
 
     // --- CASE F: Leere Daten ---
     // Edge Case: write() mit Länge 0.
     memset(&table, 0, sizeof(table));
-    calculate_entropy(&table, 0, &entropy);
+    calculate_entropy(&table, 0, &entropy,1);
     assert_fixed("Empty Input (Len 0)", entropy, "0.000 bits");
 
     printf("\nTests abgeschlossen.\n");

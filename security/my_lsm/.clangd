@@ -1,0 +1,12 @@
+CompileFlags:
+  Add:
+    - -target
+    - bpf
+    - -D__TARGET_ARCH_x86
+    - -D__BPF__
+    - -g
+    - -O2
+  IncludeDir:
+    - /work/include
+    - include
+    - src

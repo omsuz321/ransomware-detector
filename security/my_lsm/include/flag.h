@@ -2,7 +2,6 @@
 #define __FLAG_H__
 
 
-
 #define STANDALONE 0
 
 

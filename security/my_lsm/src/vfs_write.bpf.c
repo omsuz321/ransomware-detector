@@ -3,8 +3,27 @@
 #define UIO_MAXIOV 1024 
 #endif
 
+// Define file permission constants
+#ifndef MAY_READ
+#define MAY_READ 0x00000004
+#endif
+
+#ifndef MAY_WRITE
+#define MAY_WRITE 0x00000002
+#endif
+
+/* * NFSD_MAGIC repräsentiert den String "nfsd" als 4-Byte Integer.
+ * * Erklärung:
+ * Auf Little-Endian Systemen (wie Intel x86) werden Bytes "rückwärts" gespeichert.
+ * Der String "nfsd" liegt im Speicher also als 'd', 's', 'f', 'n'.
+ * * - Little Endian: 0x64('d') 73('s') 66('f') 6E('n') -> 0x6473666E
+ * - Big Endian:    0x6E('n') 66('f') 73('s') 64('d') -> 0x6E667364
+ * * Der Compiler wertet dies zur Build-Zeit aus (keine Kosten zur Laufzeit).
+ */
+#define NFSD_MAGIC (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? 0x6473666E : 0x6E667364)
+
 #ifndef __VMLINUX_H__
-#include "../include/vmlinux.h"
+#include <vmlinux.h>
 #endif
 
 #ifndef __BPF_HELPERS_
@@ -23,6 +42,16 @@
 #include "../include/common.h"
 #endif
 
+#ifndef __IO_HELPERS_H__
+#include "../include/io_helpers.h"
+#endif
+
+#ifndef __ENTROPY_H__
+#include "../include/entropy.h"
+#endif
+
+#define SHOULD_SKIP(mask) !((mask & (MAY_READ | MAY_WRITE)) && is_nfsd())
+
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -30,26 +59,7 @@ char LICENSE[] SEC("license") = "GPL";
 // SPEICHER-LAYOUT
 // ============================================================
 
-#define AIRBAG_SIZE (MAX_DATA_SIZE * 2)
-#define SCRATCH_MAP_SIZE (sizeof(struct write_event) + AIRBAG_SIZE)
-
-struct write_event {
-    __u32 pid;
-    __u32 uid;
-    __u32 len;          // Wie viele Bytes haben wir wirklich kopiert?
-    __u64 requested;    // Wie viele Bytes wollte der User schreiben?
-    char  fname[256];
-    
-    // FLEXIBLES ARRAY:
-    // In der Strukturdefinition ist es 0 Bytes groß.
-    // Im Ringbuffer nimmt es variabel viel Platz ein.
-    __u8  data[];       
-};
-
-struct scratch_t {
-    struct write_event header;
-    __u8 data_buffer[AIRBAG_SIZE];
-};
+// AIRBAG_SIZE, SCRATCH_MAP_SIZE, write_event, scratch_t now live in io_helpers.h
 
 // ============================================================
 // MAPS
@@ -74,72 +84,36 @@ struct {
     __uint(value_size, sizeof(struct freq_table)); 
 } byte_counts SEC(".maps");
 
-// ============================================================
-// CALLBACKS
-// ============================================================
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+} lsm_hits SEC(".maps");
 
-struct loop_ctx {
-    struct scratch_t *scratch;
-    struct iov_iter *iter;
-    size_t iov_offset;
-    size_t total_requested;
-    __u32 current_copied;
-};
 
-struct count_ctx {
-    struct freq_table *table;
-    __u8 *data_buffer;
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_USER_COUNT); 
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(struct user_stats_t));
+} user_tracker SEC(".maps");
 
-static __always_inline void get_filename(struct file *file, char *out, __u32 out_size)
-{
-    struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
-    const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
-    bpf_probe_read_kernel_str(out, out_size, name);
+static __always_inline int is_nfsd(void) {
+    #define COMM_SIZE 16
+    char comm[COMM_SIZE];
+    
+    //clean initilize with 0
+    __builtin_memset(comm, 0, COMM_SIZE);
+
+    if (bpf_get_current_comm(&comm, COMM_SIZE) < 0) {
+        return 0; // Fehler beim Lesen -> sicherheitshalber ignorieren
+    }
+
+    // Wenn Magic stimmt -> 1, sonst 0
+    return (*(unsigned int *)comm == NFSD_MAGIC);
 }
 
-// Daten kopieren
-static long loop_callback(__u32 i, struct loop_ctx *ctx)
-{
-    if (ctx->current_copied >= MAX_DATA_SIZE) return 1;
-
-    struct iov_iter *iter = ctx->iter; 
-    const struct kvec *kvec = BPF_CORE_READ(iter, kvec);
-    
-    void *base = BPF_CORE_READ(&kvec[i], iov_base);
-    size_t len = BPF_CORE_READ(&kvec[i], iov_len);
-    
-    size_t seg_offset = (i == 0) ? ctx->iov_offset : 0;
-
-    if (!base || len == 0 || seg_offset >= len) return 0;
-
-    size_t data_in_seg = len - seg_offset;
-    size_t space_left = MAX_DATA_SIZE - ctx->current_copied;
-    size_t to_copy = data_in_seg;
-
-    if (to_copy > space_left) to_copy = space_left;
-    
-    size_t remaining_request = ctx->total_requested - ctx->current_copied;
-    if (to_copy > remaining_request) to_copy = remaining_request;
-
-    bpf_probe_read_kernel(
-        &ctx->scratch->data_buffer[ctx->current_copied & (MAX_DATA_SIZE - 1)], 
-        to_copy & (MAX_DATA_SIZE - 1), 
-        (char*)base + seg_offset
-    );
-
-    ctx->current_copied += to_copy;
-    return 0;
-}
-
-// Zählen (Optimiert)
-static long count_bytes_fast(__u32 i, struct count_ctx *ctx)
-{
-    __u32 idx = i & (MAX_DATA_SIZE - 1);
-    __u8 byte_val = ctx->data_buffer[idx];
-    ctx->table->counts[byte_val]++;
-    return 0;
-}
 
 // ============================================================
 // HILFSFUNKTION: FIX FÜR DIE AUSGABE
@@ -174,95 +148,106 @@ static __always_inline void print_human_readable(struct freq_table *t)
     bpf_printk("================");
 }
 
-// ============================================================
-// HILFSFUNKTION: Daten sammeln
-// ============================================================
-static __always_inline u64 fill_write_event(struct scratch_t *s, struct file *file, struct iov_iter *iter)
+
+
+
+// WICHTIG: Rückgabetyp ist jetzt ein POINTER (*)
+static __always_inline struct user_stats_t *GetOrCreateUserStats(__u32 uid)
 {
-    s->header.pid = bpf_get_current_pid_tgid() >> 32;
-    s->header.uid = (__u32)bpf_get_current_uid_gid();
-    u64 requested = BPF_CORE_READ(iter, count);
-    s->header.requested = requested;
-    s->header.len = 0; 
-    s->header.fname[0] = '\0';
+    static struct user_stats_t empty_stats = {0};
+    // 1. Versuch: Existiert der User schon?
+    struct user_stats_t *stats = bpf_map_lookup_elem(&user_tracker, &uid);
+    if (stats) 
+        return stats;
+    // 2. Wenn nicht: Neu anlegen
+    // Wir nutzen die globale 'empty_stats' um den Stack nicht zu belasten
+    bpf_map_update_elem(&user_tracker, &uid, &empty_stats, BPF_NOEXIST);
     
-    get_filename(file, s->header.fname, sizeof(s->header.fname));
-
-    if (BPF_CORE_READ(iter, iter_type) == ITER_KVEC) {
-        unsigned long nr_segs = BPF_CORE_READ(iter, nr_segs);
-        if (nr_segs > UIO_MAXIOV) nr_segs = UIO_MAXIOV;
-
-        struct loop_ctx ctx = {
-            .scratch = s,
-            .iter = iter,
-            .iov_offset = BPF_CORE_READ(iter, iov_offset),
-            .total_requested = requested,
-            .current_copied = 0
-        };
-
-        bpf_loop((__u32)nr_segs, (void *)loop_callback, &ctx, 0);
-        s->header.len = ctx.current_copied;
-    }
-
-    u64 bytes_to_send = sizeof(struct write_event) + s->header.len;
-    if (bytes_to_send > SCRATCH_MAP_SIZE) bytes_to_send = SCRATCH_MAP_SIZE;
-
-    return bytes_to_send;
+    // 3. WICHTIG: Nach dem Update müssen wir den Pointer NEU holen!
+    // bpf_map_update_elem gibt nur einen Fehlercode (int) zurück, keinen Pointer.
+    return bpf_map_lookup_elem(&user_tracker, &uid);
 }
 
-static __always_inline void print_preview(void *data_ptr, u32 len)
-{
-    char msg[11]; 
-    __builtin_memset(msg, 0, sizeof(msg));
-    if (len > 10) len = 10;
-    bpf_probe_read_kernel(msg, len, data_ptr);
-    bpf_printk("CONTENT: |%s|", msg);
-}
-
-// ============================================================
-// HAUPTPROGRAMM
-// ============================================================
-SEC("kprobe/vfs_iter_write")
-int BPF_KPROBE(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
+static __always_inline int CalcEntropy(struct file *file, struct iov_iter *iter, struct fixed_point *entropy_out)
 {
     int key = 0;
     struct scratch_t *s = bpf_map_lookup_elem(&scratch_map, &key);
-    if (!s) return 0;
+    if (!s) 
+        return 0;
 
+    //füllt die scratch map und gibt die tatsächliche Länge zurück
     u64 bytes_to_send = fill_write_event(s, file, iter);
+    if(bytes_to_send < 0)
+        return 0;
 
     // Zählung & Ausgabe
     struct freq_table *table = bpf_map_lookup_elem(&byte_counts, &key);
 
-    if (table && s->header.len > 0) {
-        // Vor der Zählung: Altes löschen (optional, aber sauberer für Tests)
-        // Hier in BPF schwer möglich ohne loop, aber da per-cpu array persistent ist,
-        // addieren wir einfach weiter. Für saubere "pro Schreibvorgang" Tests
-        // müsste man das Array eigentlich nullen.
-        // Wir lassen es akkumulieren, wie besprochen.
+    //TODO überprufen, ob das jemals passieren kann, da wir ja immer einen Eintrag anlegen, bevor wir hier 
+    __u32 header_len = s->header.len;
+    if (table && header_len< 0) 
+        return 0;
 
-        struct count_ctx ctx = {
-            .table = table,
-            .data_buffer = s->data_buffer
-        };
+    struct count_ctx ctx = {
+        .table = table,
+        .data_buffer = s->data_buffer
+    };
 
-        __u32 loop_limit = s->header.len;
-        if (loop_limit > MAX_DATA_SIZE) loop_limit = MAX_DATA_SIZE;
+    __u32 loop_limit = header_len > MAX_DATA_SIZE ? MAX_DATA_SIZE : header_len;
 
-        // 1. Zählen
-        bpf_loop(loop_limit, count_bytes_fast, &ctx, 0);
+    // 1. Zählen
+    bpf_loop(loop_limit, count_bytes_fast, &ctx, 0);
 
+    //TODO entfernen 
+    print_human_readable(table);
 
-        print_human_readable(table);
-    }
-
+    //TODO entfernen
     bpf_printk("LOG: pid=%u len=%u", s->header.pid, s->header.len);
-    if (s->header.len > 0) {
-        print_preview(s->data_buffer, s->header.len);
+    if (header_len > 0) {
+        print_preview(s->data_buffer, header_len);
     }
-    
+    // Entropie berechnen und ausgeben
+    calculate_entropy(table, header_len, entropy_out, 1);
 
-    bpf_ringbuf_output(&events, &s->header, bytes_to_send, 0);
+    return 1;
+}
+// ============================================================
+// HAUPTPROGRAMM
+// ============================================================
 
+SEC("kprobe/vfs_iter_write")
+int BPF_KPROBE(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
+{
+    if (!is_nfsd())
+        return 0;
+
+    struct fixed_point entropy;
+    // Fehler bei der Berechnung -> nicht weiterverarbeiten
+    if(!CalcEntropy(file, iter, &entropy))
+        return 0; 
+    print_fixed_point("entropy", &entropy);
+    return 0;
+}
+
+
+// LSM hook: log uid for read/write permission checks (e.g., ls, write)
+SEC("lsm/file_permission")
+int BPF_PROG(log_file_permission, struct file *file, int mask)
+{
+    if (SHOULD_SKIP(mask)) 
+        return 0;
+
+
+    __u32 uid = (__u32)bpf_get_current_uid_gid();
+
+    struct user_stats_t *stats = GetOrCreateUserStats(uid);
+
+    __u32 key = 0;
+    __u64 *hits = bpf_map_lookup_elem(&lsm_hits, &key);
+    if (hits)
+        __sync_fetch_and_add(hits, 1);
+    //funktionert, weil nfsd ein credential overwrite durchführt und somit dann von nfs cleint die uid nimmt
+
+    bpf_printk("lsm file_permission uid=%u mask=0x%x", uid, mask);
     return 0;
 }

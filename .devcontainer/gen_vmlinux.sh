@@ -10,11 +10,18 @@ fi
 # Ziel: globale Datei, die alle nutzen können
 TARGET=/usr/local/include/vmlinux.h
 
-sudo mkdir -p /usr/local/include
+mkdir -p /usr/local/include
 
-sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c \
-  | sudo tee "$TARGET" >/dev/null
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > "$TARGET"
 
-sudo chmod 644 "$TARGET"
+chmod 644 "$TARGET"
 
 echo "[OK] $TARGET generated and world-readable."
+
+# Kopiere auch zu my_lsm/include für lokale Nutzung
+MY_LSM_TARGET=/work/security/my_lsm/include/vmlinux.h
+mkdir -p "$(dirname "$MY_LSM_TARGET")"
+cp "$TARGET" "$MY_LSM_TARGET"
+chmod 644 "$MY_LSM_TARGET"
+
+echo "[OK] $MY_LSM_TARGET copied."

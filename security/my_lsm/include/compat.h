@@ -11,6 +11,7 @@
 #include "flag.h"
 #endif
 
+// IMPORTANT: Define kernel types BEFORE including common.h
 #if STANDALONE
     
 	#include <stdint.h>
@@ -26,10 +27,6 @@
 	typedef short  __s16;
 	typedef int  __s32;
 	typedef long  __s64;
-
-	#ifndef __COMMON_H__
-	#include "common.h"
-	#endif
 
 	#ifndef __always_inline
 	#define __always_inline __attribute__((always_inline))
@@ -48,11 +45,20 @@
 
 	#define bpf_loop(max, cb, ctx, flags) compat_bpf_loop((max), (cb), (ctx), (flags))
 	#define COMPAT_IS_BPF 0
+
+#else
+	// In kernel mode, vmlinux.h provides the types
+	#ifndef __VMLINUX_H__
+	#include <vmlinux.h>
+	#endif
 #endif /* STANDALONE */
 
+// Include common.h AFTER all types are defined
 #ifndef __COMMON_H__
 #include "common.h"
 #endif
+
+
 
 
 
