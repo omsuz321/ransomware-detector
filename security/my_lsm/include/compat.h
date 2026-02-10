@@ -46,6 +46,10 @@
 	#define bpf_loop(max, cb, ctx, flags) compat_bpf_loop((max), (cb), (ctx), (flags))
 	#define COMPAT_IS_BPF 0
 
+	struct bpf_spin_lock {
+	__u32 val;
+	};
+
 #else
 	// In kernel mode, vmlinux.h provides the types
 	#ifndef __VMLINUX_H__

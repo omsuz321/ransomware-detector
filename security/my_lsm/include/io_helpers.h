@@ -67,7 +67,7 @@ struct copy_ctx {
 
 /* Helper functions */
 
-static __always_inline void get_filename(struct file *file, char *out, __u32 out_size)
+static  void get_filename(struct file *file, char *out, __u32 out_size)
 {
     struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
     const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
@@ -77,7 +77,7 @@ static __always_inline void get_filename(struct file *file, char *out, __u32 out
 /* * Copies a single kvec segment to the scratch buffer.
  * Returns 1 if buffer is full, 0 otherwise.
  */
-static __always_inline long copy_single_segment(__u32 seg_idx, struct copy_ctx *ctx)
+static  long copy_single_segment(__u32 seg_idx, struct copy_ctx *ctx)
 {
     if (ctx->bytes_copied >= MAX_DATA_SIZE) 
         return 1;
@@ -114,12 +114,12 @@ static __always_inline long copy_single_segment(__u32 seg_idx, struct copy_ctx *
 }
 
 /* bpf_loop callback for segments 1..N */
-static __always_inline long loop_callback_rest(__u32 i, struct copy_ctx *ctx)
+static long loop_callback_rest(__u32 i, struct copy_ctx *ctx)
 {
     return copy_single_segment(i + 1, ctx);
 }
 
-static __always_inline long count_bytes_fast(__u32 i, struct count_ctx *ctx)
+static long count_bytes_fast(__u32 i, struct count_ctx *ctx)
 {   
     if (i >= MAX_DATA_SIZE) return 0;
     __u8 byte_val = ctx->data_buffer[i];
@@ -129,7 +129,7 @@ static __always_inline long count_bytes_fast(__u32 i, struct count_ctx *ctx)
 
 /* Main logic */
 
-static __always_inline u64 fill_write_event(struct scratch_t *s, struct file *file, struct iov_iter *iter)
+static u64 fill_write_event(struct scratch_t *s, struct file *file, struct iov_iter *iter)
 {
     if (BPF_CORE_READ(iter, iter_type) != ITER_KVEC) 
         return 0;
@@ -171,7 +171,7 @@ static __always_inline u64 fill_write_event(struct scratch_t *s, struct file *fi
     return bytes_to_send;
 }
 
-static __always_inline void print_preview(void *data_ptr, u32 len)
+static void print_preview(void *data_ptr, u32 len)
 {
     char msg[11]; 
     __builtin_memset(msg, 0, sizeof(msg));

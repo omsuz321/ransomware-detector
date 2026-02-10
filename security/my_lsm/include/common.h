@@ -27,6 +27,20 @@
 #define is_signed_type(type) (((type)(-1)) < (type)1)
 #endif
 
+/**
+ * Selects the optimal bit-width for atomic operations to prevent LLVM backend crashes.
+ * 
+ * BPF ISA versions below v3 do not natively support 32-bit atomic compare-and-swap (CAS).
+ * Using a 64-bit type (u64) on 64-bit architectures ensures the compiler can map 
+ * lock acquisitions to supported 'atomic64_cmpxchg' instructions, avoiding the 
+ * "unsupported atomic operation" error during compilation.
+ */
+#if __SIZEOF_POINTER__ == 8
+    typedef __u64 lock_type;
+#else
+    typedef __u32 lock_type;
+#endif
+
 #define __IS_NEG(v) (is_signed_type(__typeof__(v)) && (v) < 0)
 
 #ifndef min
@@ -58,12 +72,21 @@ struct entropy_ctx {
     struct freq_table *table;
 };
 
+struct entropy_data{
+    struct fixed_point entropy_sum;
+    __u64 count;
+    struct bpf_spin_lock lock;
+};
+
+
 struct user_stats_t {
     struct fixed_point read_write_ratio;
-    struct fixed_point entropy_sum;
+    struct entropy_data entropy_data;
+    __u64 last_access_ms;
     __u64 read_count;
     __u64 write_count;
-    __u8 thread_level;
+    __u32 thread_level;
+    lock_type stats_lock;  // Protects thread_level and last_access_ms
 };
 
 #endif /* __COMMON_H */

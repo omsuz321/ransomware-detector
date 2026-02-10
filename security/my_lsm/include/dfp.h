@@ -49,7 +49,7 @@
 // Helper Functions - Bit Operations
 // ============================================================================
 
-static __always_inline int count_zero_64(__u64 x)
+static int count_zero_64(__u64 x)
 {
     if (x == 0) return 64;
     int count = 0;
@@ -61,7 +61,7 @@ static __always_inline int count_zero_64(__u64 x)
     return count;
 }
 
-static __always_inline int count_zero_32(__u32 x)
+static int count_zero_32(__u32 x)
 {
     if (x == 0) return 32;
     int count = 0;
@@ -73,7 +73,7 @@ static __always_inline int count_zero_32(__u32 x)
     return count;
 }
 
-static __always_inline __u64 mag_u64_from_s64(__s64 v)
+static __u64 mag_u64_from_s64(__s64 v)
 {
     __u64 u = (__u64)v;
     if (v >= 0) return u;
@@ -84,7 +84,7 @@ static __always_inline __u64 mag_u64_from_s64(__s64 v)
 // Helper Functions - Arithmetic Shifts
 // ============================================================================
 
-static __always_inline __s64 arshift_s64(__s64 v, int sh)
+static __s64 arshift_s64(__s64 v, int sh)
 {
     if (sh <= 0) return v;
     if (sh >= 63) return (v < 0) ? (__s64)-1 : (__s64)0;
@@ -97,7 +97,7 @@ static __always_inline __s64 arshift_s64(__s64 v, int sh)
     return (__s64)(shifted | mask);
 }
 
-static __always_inline __s32 arshift_s32(__s32 v, int sh)
+static __s32 arshift_s32(__s32 v, int sh)
 {
     if (sh <= 0) return v;
     if (sh >= 31) return (v < 0) ? (__s32)-1 : (__s32)0;
@@ -114,7 +114,7 @@ static __always_inline __s32 arshift_s32(__s32 v, int sh)
 // Core Normalization & Conversion
 // ============================================================================
 
-static __always_inline void normalize_i64_to_fp(__s64 *raw_ptr, __s32 *q_ptr)
+static void normalize_i64_to_fp(__s64 *raw_ptr, __s32 *q_ptr)
 {
     __s64 raw = *raw_ptr;
     __s32 q = *q_ptr;
@@ -141,7 +141,7 @@ static __always_inline void normalize_i64_to_fp(__s64 *raw_ptr, __s32 *q_ptr)
     *q_ptr = q;
 }
 
-static __always_inline int can_scale_left_to_i32(__s32 v, int sh)
+static int can_scale_left_to_i32(__s32 v, int sh)
 {
     if (sh <= 0) return 1;
     if (sh >= 31) return 0;
@@ -150,7 +150,7 @@ static __always_inline int can_scale_left_to_i32(__s32 v, int sh)
     return (v <= limit_pos && v >= limit_neg);
 }
 
-static __always_inline struct fixed_point to_fixed_point(__s32 value, __s32 q)
+static struct fixed_point to_fixed_point(__s32 value, __s32 q)
 {
     if (q < 0)  q = 0;
     if (q > 31) q = 31;
@@ -167,7 +167,7 @@ static __always_inline struct fixed_point to_fixed_point(__s32 value, __s32 q)
 // Quantum Alignment
 // ============================================================================
 
-static __always_inline void check_bit(struct fixed_point *first, struct fixed_point *second)
+static void check_bit(struct fixed_point *first, struct fixed_point *second)
 {
     if (first->q > second->q) {
         int diff = first->q - second->q;
@@ -202,7 +202,7 @@ static __always_inline void check_bit(struct fixed_point *first, struct fixed_po
 // Arithmetic Operations
 // ============================================================================
 
-static __always_inline struct fixed_point add(struct fixed_point *first, struct fixed_point *second)
+static struct fixed_point add(struct fixed_point *first, struct fixed_point *second)
 {
     struct fixed_point f = *first;
     struct fixed_point s = *second;
@@ -215,7 +215,7 @@ static __always_inline struct fixed_point add(struct fixed_point *first, struct 
     return result;
 }
 
-static __always_inline struct fixed_point subtract(struct fixed_point *first, struct fixed_point *second)
+static  struct fixed_point subtract(struct fixed_point *first, struct fixed_point *second)
 {
     struct fixed_point f = *first;
     struct fixed_point s = *second;
@@ -228,7 +228,7 @@ static __always_inline struct fixed_point subtract(struct fixed_point *first, st
     return result;
 }
 
-static __always_inline struct fixed_point multiply(struct fixed_point *first, struct fixed_point *second)
+static  struct fixed_point multiply(struct fixed_point *first, struct fixed_point *second)
 {
     struct fixed_point f = *first;
     struct fixed_point s = *second;
@@ -244,7 +244,7 @@ static __always_inline struct fixed_point multiply(struct fixed_point *first, st
     return result;
 }
 
-static __always_inline struct fixed_point divide(struct fixed_point *first, struct fixed_point *second)
+static struct fixed_point divide(struct fixed_point *first, struct fixed_point *second)
 {
     struct fixed_point f = *first;
     struct fixed_point s = *second;
@@ -331,7 +331,7 @@ static __always_inline struct fixed_point calc_log(struct fixed_point *number)
     return r;
 }
 
-static __always_inline struct fixed_point abs_val(struct fixed_point *number)
+static struct fixed_point abs_val(struct fixed_point *number)
 {
     struct fixed_point res = *number;
     if (res.number == (__s32)S32_MIN) res.number = S32_MAX;
@@ -342,7 +342,7 @@ static __always_inline struct fixed_point abs_val(struct fixed_point *number)
 /**
  * print_fixed_point - Hilfsfunktion: Gibt Fixed-Point als "X.YYY" im Log aus
  */
-static __always_inline void print_fixed_point(const char* prefix, struct fixed_point *fp)
+static void print_fixed_point(const char* prefix, struct fixed_point *fp)
 {
 	__s32 integer_part = fp->number >> fp->q;
 	__s32 mask = (1 << fp->q) - 1;
