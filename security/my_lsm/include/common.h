@@ -7,9 +7,9 @@
 #endif
 
 #if STANDALONE
-    #include "compat.h"
+#include "compat.h"
 #else
-    #include <vmlinux.h>
+#include <vmlinux.h>
 #endif
 
 
@@ -18,6 +18,9 @@
 #define MAX_BYTE_VALUES 256U
 #define MAX_USER_COUNT 1024U
 
+#define ENTROPY_THRESHOLD ((struct fixed_point ) { .number = 15, .q = 1 })// 7.5 in decinal, equelas 111.1 in binary, this means afteer the shit we have 1111.0, ,wthile the number before is 8 and bumber of shifts is 1
+#define RW_RATIO_LOWER_THRESHOLD ((struct fixed_point ) { .number = 10, .q = 0 }) // Threshold for read/write ratio (e.g., 10:1)
+#define RW_RATIO_UPPER_THRESHOLD ((struct fixed_point ) { .number = 10, .q = 0 }) // Threshold for read/write ratio (e.g., 10:1)
 
 // ------------------------------------------------------------
 // DAS SMARTE MIN() MAKRO (Mit goto-Optimierung)
@@ -41,6 +44,13 @@
     typedef __u32 lock_type;
 #endif
 
+struct fixed_point {
+    __s32 number;
+    __s32 q;
+};
+
+
+
 #define __IS_NEG(v) (is_signed_type(__typeof__(v)) && (v) < 0)
 
 #ifndef min
@@ -55,13 +65,6 @@
 })
 #endif
 
-
-
-struct fixed_point {
-    __s32 number;
-    __s32 q;
-};
-
 struct freq_table {
     __u16 counts[MAX_BYTE_VALUES];
 };
@@ -74,7 +77,7 @@ struct entropy_ctx {
 
 struct entropy_data{
     struct fixed_point entropy_sum;
-    __u64 count;
+    __u32 count;
     struct bpf_spin_lock lock;
 };
 
@@ -83,11 +86,13 @@ struct user_stats_t {
     struct fixed_point read_write_ratio;
     struct entropy_data entropy_data;
     __u64 last_access_ms;
-    __u64 read_count;
-    __u64 write_count;
-    __u32 thread_level;
     lock_type stats_lock;  // Protects thread_level and last_access_ms
+    __s32 read_count;
+    __s32 write_count;
+    __s32 open_count;
+    __s8 thread_level;
 };
+
 
 #endif /* __COMMON_H */
 

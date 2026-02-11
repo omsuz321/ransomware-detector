@@ -44,6 +44,9 @@
 #define S32_MAX  2147483647
 #define S32_MIN (-2147483647 - 1)
 
+#define A_IS_GRATHER_B(a, b) (fp_compare(a, b) == 1)
+#define A_IS_LESS_B(a, b) (fp_compare(a, b) == -1)
+
 
 // ============================================================================
 // Helper Functions - Bit Operations
@@ -337,6 +340,31 @@ static struct fixed_point abs_val(struct fixed_point *number)
     if (res.number == (__s32)S32_MIN) res.number = S32_MAX;
     else if (res.number < 0)        res.number = -res.number;
     return res;
+}
+
+// ============================================================================
+// Comparison Operations
+// ============================================================================
+
+/* * fp_compare: Compares two fixed point numbers safely.
+ * Returns:
+ * 1 if a > b
+ * -1 if a < b
+ * 0 if a == b
+ */
+static int fp_compare(struct fixed_point *a, struct fixed_point *b)
+{
+    // 1. Make local copies so we don't modify the originals
+    struct fixed_point ta = *a;
+    struct fixed_point tb = *b;
+
+    // 2. Align them to the same Q-Factor using library's helper
+    check_bit(&ta, &tb);
+
+    // 3. Compare the raw integer values
+    if (ta.number > tb.number) return 1;
+    if (ta.number < tb.number) return -1;
+    return 0;
 }
 
 /**

@@ -27,15 +27,19 @@
 #include "dfp.h"
 #endif
 
-
-static __always_inline struct fixed_point calculate_read_write_ratio(__s32 total_written, __s32 total_read)
+static struct fixed_point calculate_read_write_ratio(__s32 total_written, __s32 total_read)
 {
     if (total_written == 0 && total_read == 0)
         return (struct fixed_point){ .number = 0, .q = 0 };
     struct fixed_point written_fp = to_fixed_point(total_written, 0);
     struct fixed_point read_fp = to_fixed_point(total_read, 0);
-
     return divide(&written_fp, &read_fp);
+}
+
+static int malicious_read_write_ratio(struct user_stats_t *stats)
+{
+    struct fixed_point ratio = calculate_read_write_ratio(stats->write_count, stats->read_count);
+    return A_IS_GRATHER_B(&ratio, &RW_RATIO_UPPER_THRESHOLD) || A_IS_LESS_B(&ratio, &RW_RATIO_LOWER_THRESHOLD) ? 1 : -1;
 }
 
 #endif // __READ_WRITE_RATIO_H

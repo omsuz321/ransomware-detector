@@ -1,4 +1,7 @@
 // Definieren wir selbst, da wir linux/uio.h nicht inkludieren können
+#include "common.h"
+#include "dfp.h"
+#include "vmlinux.h"
 #ifndef UIO_MAXIOV
 #define UIO_MAXIOV 1024 
 #endif
@@ -21,7 +24,7 @@
 #define STAGE_INVESTIGATION     1  
 
 // Stage 3: Verdict (Urteilsfindung)
-#define STAGE_VERDICT           2  
+#define STAGE_VERDICT 2  
 #define BLOCK_ACTION 3
 
 #define NFSD_MAGIC (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? 0x6473666E : 0x6E667364)
@@ -56,7 +59,9 @@
 
 
 #define SHOULD_IGNORE_EVENT(mask) (!((mask & (MAY_READ | MAY_WRITE)) && is_nfsd() ))
-#define SHOULD_SKIP_STAGE_OR_WORK(stage, stats) (stats->thread_level != stage || stats->stats_lock == 1)
+// the ordr matters, as wthing the region that we lock, we also update hte thread:level, thus ensureing, that we oyuls only 
+// do the decision logic for one thread, because only one thread would have updated the thread level, the other ones would see that the thread level is already updated and skip the decision logic, even if they also triggered the time based trigger
+#define SHOULD_SKIP_STAGE_OR_WORK(stage, stats) (stats->stats_lock == 1 || stats->thread_level != stage)
 #define GET_USER_UID() (__u32)bpf_get_current_uid_gid()
 //if true, someone else has the lock
 #define TRY_LOCK_USER_T_OR_SKIP(stats) (__sync_val_compare_and_swap(&stats->stats_lock, 0, 1) == 0)
@@ -113,10 +118,10 @@ static int is_nfsd(void) {
 
 static void CountEvent(int mask, struct user_stats_t *stats, __u32 uid)
 {
-    if( mask & MAY_WRITE )
+    if (mask & MAY_WRITE)
         __sync_fetch_and_add(&stats->write_count, 1);
-    
-    __sync_fetch_and_add(&stats->read_count, 1);
+    else if (mask & MAY_READ)
+        __sync_fetch_and_add(&stats->read_count, 1);
 }
 //
 
@@ -196,38 +201,49 @@ static int CalcEntropy(struct file *file, struct iov_iter *iter, struct fixed_po
     return 1;
 }
 
-static __always_inline __u8 NormaleRateExeded()
+static __always_inline __u8 has_exeeded_normal_open_rate()
 {
     return 0;
 }
 
-static __always_inline __u8 CheckReadWriteRatio()
+static  __s8 has_malicoud_r_w_ratio(struct user_stats_t *stats)
 {
-    return 0;
+    struct fixed_point read = { .number = stats->read_count, .q = 0 };
+    struct fixed_point write = { .number = stats->write_count, .q = 0 };
+    struct fixed_point ratio = divide(&read, &write);
+
+    //mach dhier den vergleich mit einem schwellenwert, z.B. wenn mehr als 10 mal so viele writes wie reads, dann return 1, sonst return -1
+    return A_IS_GRATHER_B(&ratio, &RW_RATIO_LOWER_THRESHOLD ) &&
+           A_IS_LESS_B(&ratio, & RW_RATIO_UPPER_THRESHOLD) 
+           ? 1 : -1;
 }
 
-static __always_inline __u8 CheckEntropy()
-{
-    return 0;
+
+
+static  __s8 has_malicious_entropy_score(struct entropy_data *entropy_data)
+{   
+    struct fixed_point avg_entropy = get_avg_entropy(entropy_data);
+    __s8 ret = A_IS_GRATHER_B(&avg_entropy, &ENTROPY_THRESHOLD) == 1 ? 1 : -1;
+    return ret;
 }
 
 static int thread_level_decision(struct user_stats_t *stats)
 {
-    __u32 thread_level = stats->thread_level;
+    // cast is premissibale because we only have 3 stages, so the thread_level will never exceed the range of __s8
+    __s8 thread_level = stats->thread_level;
     switch(thread_level) 
     {
         case STAGE_SCREENING:
-            bpf_printk("[Decision] SCREENING: Pruefe tägliche Rate");
-            thread_level += NormaleRateExeded();
-            bpf_printk("[Decision] Rate-Check Resultat: +%u", NormaleRateExeded());
+            thread_level += has_exeeded_normal_open_rate();
+
             break;
     
         case STAGE_INVESTIGATION:
-            thread_level += CheckReadWriteRatio();
+            thread_level += has_malicoud_r_w_ratio(stats);
             break;
             
         case STAGE_VERDICT:
-            thread_level += CheckEntropy();
+            thread_level += has_malicious_entropy_score(&stats->entropy_data);
             break;
         default:
             break;
@@ -259,35 +275,23 @@ static int process_entropy(struct file *file, struct iov_iter *iter, struct entr
 
 static int process(struct user_stats_t *stats)
 {
-    bpf_printk("TRY_LOCK_USER_T_OR_SKIP entered ", BPF_KTIME_GET_MS());
+    bpf_printk("TRY_LOCK_USER_T_OR_SKIP entered %llu", BPF_KTIME_GET_MS());
     if(TRY_LOCK_USER_T_OR_SKIP(stats))
     {
-        bpf_printk("Inside TRY_LOCK_USER_T_OR_SKIP  ", BPF_KTIME_GET_MS());
+        bpf_printk("Inside TRY_LOCK_USER_T_OR_SKIP  %llu", BPF_KTIME_GET_MS());
         thread_level_decision(stats);
         stats->last_access_ms = BPF_KTIME_GET_MS();
         UNLOCK_USER_T(stats);
     }
-    bpf_printk("Outside TRY_LOCK_USER_T_OR_SKIP entered ", BPF_KTIME_GET_MS());
+    bpf_printk("Outside TRY_LOCK_USER_T_OR_SKIP %llu", BPF_KTIME_GET_MS());
     return 0;
 }
 
-SEC("fentry/vfs_iter_write")
-int BPF_PROG(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
+static int try_run_detection(struct user_stats_t *stats, int stage_name)
 {
-    if (!is_nfsd()) 
-        return 0;
-
-    struct user_stats_t *stats;
-    __u32 uid = GET_USER_UID();
-
-    stats = GetOrCreateUserStats(uid);
-    if (!stats)
-        return 0;
-    stats->thread_level = 2;
-
     // Only collect entropy in VERDICT stage or Skip if decision is already in progress
     bpf_printk("Enter: SHOULD_SKIP_STAGE_OR_WORKk entered ");
-    if(SHOULD_SKIP_STAGE_OR_WORK(STAGE_VERDICT, stats))
+    if(SHOULD_SKIP_STAGE_OR_WORK(stage_name, stats))
     {
         bpf_printk("Skip: SHOULD_SKIP_STAGE_OR_WORKk entered ");
         bpf_printk("Current thread level: %u", stats->thread_level);
@@ -299,14 +303,36 @@ int BPF_PROG(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
 
     bpf_printk("Pass: SHOULD_SKIP_STAGE_OR_WORKk ");
 
-    if(!trigger_detector(stats))
-    {   bpf_printk("Process Entropy: look entered ");
-        process_entropy(file, iter, &stats->entropy_data);
-        bpf_printk("Process Entropy: look entered ");
+    if(trigger_detector(stats))
+    {
+        bpf_printk("Trigger Detector passed -> do detction possibly");
+        process(stats);
+        return 1;
+    }
+    return  0;
+}
+
+SEC("fentry/vfs_iter_write")
+int BPF_PROG(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
+{
+    if (!is_nfsd()) 
+        return 0;
+    struct user_stats_t *stats;
+    __u32 uid = GET_USER_UID();
+
+    stats = GetOrCreateUserStats(uid);
+    if (!stats)
+    {
+        bpf_printk("Failed to get or create user stats for UID %u", uid);
         return 0;
     }
-    bpf_printk("Trigger Detector passed -> do detction possibly");
-    process(stats);
+    if(try_run_detection(stats, STAGE_VERDICT))
+        return 0;
+
+    bpf_printk("Process Entropy: look entered ");
+    process_entropy(file, iter, &stats->entropy_data);
+    bpf_printk("Process Entropy: look entered ");
+
     return 0; 
 }
 
@@ -323,10 +349,27 @@ int BPF_PROG(log_file_permission, struct file *file, int mask)
     if (!stats)
         return 0;
     
+    if(try_run_detection(stats, STAGE_SCREENING))
+        return 0;
+
     // Just count the event in file_permission handler
     // Decision happens in vfs_iter_write_enter with proper locking
     bpf_printk("Enter: CountEvent  ");
     CountEvent(mask, stats, uid);
     bpf_printk("Exit: CountEvent  ");
+    return 0;
+}
+
+SEC("lsm/file_open")
+int BPF_PROG(lsm_file_open, struct file *file)
+{
+    if (!is_nfsd())  // oder dein lokales VFS-Filter
+        return 0;
+
+    bpf_printk("open file: %s", file->f_path.dentry->d_name.name);
+    // daten sammeln ...
+    // wenn blocken:
+
+    // sonst:
     return 0;
 }

@@ -66,7 +66,7 @@ static long entropy_sum_and_reset_count_callback(__u32 i, struct entropy_ctx *ct
 /**
  * calculate_entropy - Berechnet Shannon-Entropie, lässt Tabelle unverändert
  */
-static __always_inline void calculate_entropy(
+static void calculate_entropy(
     struct freq_table *table,
     __u32 total_len, 
     struct fixed_point *out_result,
@@ -94,6 +94,12 @@ static __always_inline void calculate_entropy(
     struct fixed_point term2 = divide(&ctx.sum_result, &N_fp);
     
     *out_result = subtract(&log_N, &term2);
+}
+
+static __always_inline struct fixed_point get_avg_entropy(struct entropy_data *entropy_data)
+{
+    struct fixed_point divided = { .number = (__s32)entropy_data->count, .q = 0 };
+    return divide(&entropy_data->entropy_sum, &divided);
 }
 #endif /*  */
 
