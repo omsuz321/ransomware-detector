@@ -173,10 +173,11 @@ static u64 fill_write_event(struct scratch_t *s, struct file *file, struct iov_i
 
 static void print_preview(void *data_ptr, u32 len)
 {
-    char msg[11]; 
+    char msg[12]; 
     __builtin_memset(msg, 0, sizeof(msg));
     if (len > 10) len = 10;
     bpf_probe_read_kernel(msg, len, data_ptr);
+    msg[len] = '\0';  // Ensure null-termination
     bpf_printk("CONTENT: |%s|", msg);
 }
 

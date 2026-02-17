@@ -47,12 +47,43 @@ void test_read_write_ratio_large_values(void) {
     assertTest("Large Values", ratio, (double)reads / writes);
 }
 
+void test_symmetry_index_equal(void) {
+    int reads = 10;
+    int writes = 10;
+    struct fixed_point sym = symmetry_index(writes, reads);
+    assertTest("Symmetry (Equal)", sym, 0.0);
+}
+
+void test_symmetry_index_skewed(void) {
+    int reads = 10;
+    int writes = 0;
+    struct fixed_point sym = symmetry_index(writes, reads);
+    assertTest("Symmetry (0/10)", sym, 1.0);
+}
+
+void test_malicious_read_write_ratio(void) {
+    struct user_stats_t stats = { 0 };
+
+    stats.read_count = 10;
+    stats.write_count = 9;
+    assert(malicious_read_write_ratio(&stats) == 1);
+    printf("[TEST] Malicious Ratio (10/9) -> PASS\n");
+
+    stats.read_count = 100;
+    stats.write_count = 1;
+    assert(malicious_read_write_ratio(&stats) == -1);
+    printf("[TEST] Malicious Ratio (100/1) -> PASS\n");
+}
+
 int main(void) {
     test_read_write_ratio_basic();
     test_read_write_ratio_equal();
     test_read_write_ratio_zero_reads();
     test_read_write_ratio_zero_writes();
     test_read_write_ratio_large_values();
+    test_symmetry_index_equal();
+    test_symmetry_index_skewed();
+    test_malicious_read_write_ratio();
     printf("All tests passed!\n");
     return 0;
 }

@@ -46,6 +46,9 @@
 
 #define A_IS_GRATHER_B(a, b) (fp_compare(a, b) == 1)
 #define A_IS_LESS_B(a, b) (fp_compare(a, b) == -1)
+#define A_IS_GREATER_OR_EQUAL_B(a, b) (fp_compare(a, b) != -1)
+#define A_IS_LESS_OR_EQUAL_B(a, b) (fp_compare(a, b) != 1)
+
 
 
 // ============================================================================
@@ -372,16 +375,16 @@ static int fp_compare(struct fixed_point *a, struct fixed_point *b)
  */
 static void print_fixed_point(const char* prefix, struct fixed_point *fp)
 {
-	__s32 integer_part = fp->number >> fp->q;
-	__s32 mask = (1 << fp->q) - 1;
-	__s32 fractional_bits = fp->number & mask;
-    
-	// Umrechnung auf 3 Dezimalstellen
-	__s64 frac_calc = (__s64)fractional_bits * 1000;
-	__s32 decimal_part = (__s32)(frac_calc >> fp->q);
-	if (decimal_part < 0) decimal_part = -decimal_part;
+    __s32 integer_part = arshift_s32(fp->number, fp->q);
+    __u32 mask = (fp->q >= 31) ? 0x7fffffffU : ((1U << fp->q) - 1U);
+    __u64 mag = mag_u64_from_s64((__s64)fp->number);
+    __u32 fractional_bits = (__u32)mag & mask;
 
-	bpf_printk("%s: %d.%03d", prefix, integer_part, decimal_part);
+    // Umrechnung auf 3 Dezimalstellen
+    __u64 frac_calc = (__u64)fractional_bits * 1000ULL;
+    __u32 decimal_part = (fp->q == 0) ? 0U : (__u32)(frac_calc >> fp->q);
+
+    bpf_printk("%s: %d.%03u", prefix, integer_part, decimal_part);
 }
 
 #endif // __BPF_DFP_H__

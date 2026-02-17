@@ -27,6 +27,7 @@
 #include "dfp.h"
 #endif
 
+
 static struct fixed_point calculate_read_write_ratio(__s32 total_written, __s32 total_read)
 {
     if (total_written == 0 && total_read == 0)
@@ -36,10 +37,19 @@ static struct fixed_point calculate_read_write_ratio(__s32 total_written, __s32 
     return divide(&written_fp, &read_fp);
 }
 
-static int malicious_read_write_ratio(struct user_stats_t *stats)
+//this fun will clacule the symmetiry index
+//assuing the numbes are positiv
+static __always_inline struct fixed_point symmetry_index(__s32 total_written, __s32 total_read)
 {
-    struct fixed_point ratio = calculate_read_write_ratio(stats->write_count, stats->read_count);
-    return A_IS_GRATHER_B(&ratio, &RW_RATIO_UPPER_THRESHOLD) || A_IS_LESS_B(&ratio, &RW_RATIO_LOWER_THRESHOLD) ? 1 : -1;
+    if(total_read + total_written == 0)
+        return (struct fixed_point){ .number = 0, .q = 0 };
+
+    // abs value of (total_written - total_read) / (total_written + total_read)
+    __s32 __dividend = total_written > total_read ? total_written - total_read : total_read - total_written;
+    __s32 __divisor = total_read + total_written;
+    struct fixed_point dividend = to_fixed_point(__dividend, 0);
+    struct fixed_point divisor = to_fixed_point(__divisor, 0);
+    return divide(&dividend, &divisor);
 }
 
-#endif // __READ_WRITE_RATIO_H
+#endif /* __READ_WRITE_RATIO_H */

@@ -7,9 +7,15 @@
 #endif
 
 #if STANDALONE
-#include "compat.h"
+    #include "compat.h"
 #else
-#include <vmlinux.h>
+    #ifndef __VMLINUX_H__
+    #include <vmlinux.h>
+    #endif
+    
+    #ifndef __BPF_HELPERS_H__
+    #include <bpf/bpf_helpers.h>
+    #endif
 #endif
 
 
@@ -18,16 +24,29 @@
 #define MAX_BYTE_VALUES 256U
 #define MAX_USER_COUNT 1024U
 
-#define ENTROPY_THRESHOLD ((struct fixed_point ) { .number = 15, .q = 1 })// 7.5 in decinal, equelas 111.1 in binary, this means afteer the shit we have 1111.0, ,wthile the number before is 8 and bumber of shifts is 1
-#define RW_RATIO_LOWER_THRESHOLD ((struct fixed_point ) { .number = 10, .q = 0 }) // Threshold for read/write ratio (e.g., 10:1)
-#define RW_RATIO_UPPER_THRESHOLD ((struct fixed_point ) { .number = 10, .q = 0 }) // Threshold for read/write ratio (e.g., 10:1)
+// Define file permission constants
 
-// ------------------------------------------------------------
-// DAS SMARTE MIN() MAKRO (Mit goto-Optimierung)
-// ------------------------------------------------------------
+#define MAY_READ 0x00000004
+#define MAY_WRITE 0x00000002
+
+#define COMM_SIZE 16
+// ungefähr entpsicht 0.302260
+#define RW_SYMMERTY_TOLLERANCE ((struct fixed_point ) { .number = 15, .q = 1 })
+#define ENTROPY_THRESHOLD ((struct fixed_point ) { .number = 15, .q = 1 })// 7.5 in decinal, equelas 111.1 in binary, this means afteer the shit we have 1111.0, ,wthile the number before is 8 and bumber of shifts is 1
+
 
 #ifndef is_signed_type
 #define is_signed_type(type) (((type)(-1)) < (type)1)
+#endif
+
+#define NFSD_MAGIC (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? 0x6473666E : 0x6E667364)
+
+
+#define DEBUG_LOG 1
+#if DEBUG_LOG
+#define BPF_LOG(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__);
+#else
+#define BPF_LOG(fmt, ...)
 #endif
 
 /**
@@ -82,16 +101,39 @@ struct entropy_data{
 };
 
 
+
 struct user_stats_t {
-    struct fixed_point read_write_ratio;
     struct entropy_data entropy_data;
     __u64 last_access_ms;
-    lock_type stats_lock;  // Protects thread_level and last_access_ms
+    volatile lock_type stats_lock;  // Protects thread_level and last_access_ms
     __s32 read_count;
     __s32 write_count;
     __s32 open_count;
+    __s32 used_bucket_capacity;
     __s8 thread_level;
 };
+
+static void print_stats(struct user_stats_t *stats, __u32 uid)
+{
+    BPF_LOG("UID %u | open count: %d, bucket: %d, tl: %d", 
+            uid, stats->open_count, stats->used_bucket_capacity, stats->thread_level)
+    BPF_LOG("UID %u | read count: %d, write count: %d", 
+            uid, stats->read_count, stats->write_count)
+    BPF_LOG("last access: %llu lock: %d", stats->last_access_ms, stats->stats_lock)
+}
+
+static int is_nfsd(void) {
+
+    char comm[COMM_SIZE];
+    
+    __builtin_memset(comm, 0, COMM_SIZE);
+    if (bpf_get_current_comm(&comm, COMM_SIZE) < 0) 
+        return 0; 
+    
+    return (*(unsigned int *)comm == NFSD_MAGIC);
+}
+
+
 
 
 #endif /* __COMMON_H */

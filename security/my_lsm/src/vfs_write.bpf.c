@@ -1,64 +1,35 @@
 // Definieren wir selbst, da wir linux/uio.h nicht inkludieren können
-#include "common.h"
-#include "dfp.h"
-#include "vmlinux.h"
-#ifndef UIO_MAXIOV
-#define UIO_MAXIOV 1024 
-#endif
 
-// Define file permission constants
-#ifndef MAY_READ
-#define MAY_READ 0x00000004
-#endif
+#include "../include/vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 
-#ifndef MAY_WRITE
-#define MAY_WRITE 0x00000002
-#endif
+#include "../include/common.h"
+#include "../include/dfp.h"
+#include "../include/io_helpers.h"
+#include "../include/entropy.h"
+#include "../include/read_write_ratio.h"
+#include "../include/leaky_bucket.h"
+
+
 
 #define INTERVAL_MS 500ULL
 
 // Stage 1: Screening (Rasterfahndung)
 #define STAGE_SCREENING   0  
-
 // Stage 2: Investigation (Beweissicherung)
 #define STAGE_INVESTIGATION     1  
-
 // Stage 3: Verdict (Urteilsfindung)
 #define STAGE_VERDICT 2  
 #define BLOCK_ACTION 3
 
-#define NFSD_MAGIC (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? 0x6473666E : 0x6E667364)
-
-#ifndef __VMLINUX_H__
-#include <vmlinux.h>
-#endif
-
-#ifndef __BPF_HELPERS_
-#include <bpf/bpf_helpers.h>
-#endif
-
-#ifndef __BPF_TRACING_H__
-#include <bpf/bpf_tracing.h>
-#endif
-
-#ifndef __BPF_CORE_READ_H__
-#include <bpf/bpf_core_read.h>
-#endif
-
-#ifndef __COMMON_H
-#include "../include/common.h"
-#endif
-
-#ifndef __IO_HELPERS_H__
-#include "../include/io_helpers.h"
-#endif
-
-#ifndef __ENTROPY_H__
-#include "../include/entropy.h"
-#endif
+#define SCREENING_INTERVAL_MS 1000ULL
+#define INVESTIGATION_INTERVAL_MS 2000ULL
+#define VERDICT_INTERVAL_MS 3000ULL
 
 
-#define SHOULD_IGNORE_EVENT(mask) (!((mask & (MAY_READ | MAY_WRITE)) && is_nfsd() ))
+#define SHOULD_IGNORE_EVENT(mask) ( !is_nfsd() || (mask != MAY_READ && mask != MAY_WRITE) )
 // the ordr matters, as wthing the region that we lock, we also update hte thread:level, thus ensureing, that we oyuls only 
 // do the decision logic for one thread, because only one thread would have updated the thread level, the other ones would see that the thread level is already updated and skip the decision logic, even if they also triggered the time based trigger
 #define SHOULD_SKIP_STAGE_OR_WORK(stage, stats) (stats->stats_lock == 1 || stats->thread_level != stage)
@@ -72,13 +43,13 @@
 #define LOCK_STATS(stats) bpf_spin_lock(&(stats)->stats_lock)
 #define UNLOCK_STATS(stats) bpf_spin_unlock(&(stats)->stats_lock)
 
-// Mark as static to allow the compiler/verifier to treat it as a sub-program
-
-
 #define BPF_KTIME_GET_MS() (bpf_ktime_get_ns() / 1000000ULL)
+
 
 char LICENSE[] SEC("license") = "GPL";
 
+struct fixed_point __symmetriy_index_tollerance = RW_SYMMERTY_TOLLERANCE;
+struct fixed_point __entropy_threshold = ENTROPY_THRESHOLD;
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -101,35 +72,39 @@ struct {
     __type(value, struct user_stats_t);
 } user_tracker SEC(".maps");
 
-static int is_nfsd(void) {
-    #define COMM_SIZE 16
-    char comm[COMM_SIZE];
-    
-    __builtin_memset(comm, 0, COMM_SIZE);
-    if (bpf_get_current_comm(&comm, COMM_SIZE) < 0) 
-        return 0; 
-    
-    return (*(unsigned int *)comm == NFSD_MAGIC);
-}
-
-// Simple non-atomic lock (acceptable for BPF + statistics)
-// Race condition OK: worst case both threads try decision simultaneously
-#define BPF_KTIME_GET_MS() (bpf_ktime_get_ns() / 1000000ULL)
-
+// it can only be one of them. therefore i can use jus t one lock for both the thread level and the last access time, because only the thread that updaets the thread level would also update the last access time, thus ensuring that we have a consistent view of the thread level and the last access time, because if another thread has updated the thread level, then we know that it has also updated the last access time, thus we can use the last access time to determine whether we should do the decision logic or not
 static void CountEvent(int mask, struct user_stats_t *stats, __u32 uid)
 {
-    if (mask & MAY_WRITE)
+    bpf_printk("mask: %d", mask);
+    if (mask == MAY_WRITE)
+    {
+        bpf_printk("enter write");
         __sync_fetch_and_add(&stats->write_count, 1);
-    else if (mask & MAY_READ)
+        return;
+    }
+    else if (mask == MAY_READ)
+    {
+        bpf_printk("enter read");
         __sync_fetch_and_add(&stats->read_count, 1);
+    }
 }
-//
 
 // when we do return 1, this means we di the update. this means that only we would be able to do the decision logic, because we are the only one that updated the last_access_ms value. if we return 0, this means that another thread has already updated the last_access_ms value and therefore we should not do the decision logic, because another thread is already doing it
 static int trigger_detector(struct user_stats_t *stats)
 {
     __u64 now = BPF_KTIME_GET_MS();
-    return now - stats->last_access_ms >= INTERVAL_MS; 
+
+    switch(stats->thread_level)
+    {
+        case STAGE_SCREENING:
+            return now - stats->last_access_ms >= SCREENING_INTERVAL_MS; 
+        case STAGE_INVESTIGATION:
+            return now - stats->last_access_ms >= INVESTIGATION_INTERVAL_MS; 
+        case STAGE_VERDICT:
+            return now - stats->last_access_ms >= VERDICT_INTERVAL_MS; 
+        default:
+            return 0;
+    }
 }
 
 /** 
@@ -155,13 +130,17 @@ static void print_human_readable(struct freq_table *t)
 static struct user_stats_t *GetOrCreateUserStats(__u32 uid)
 {
     struct user_stats_t *stats = bpf_map_lookup_elem(&user_tracker, &uid);
-    if (stats) 
+    if (stats)
         return stats;
+
+    //BPF_LOG("Creating new user stats for UID %u", uid)
+    struct user_stats_t init_stats = {0};
+    init_stats.last_access_ms = BPF_KTIME_GET_MS();
+    init_stats.thread_level = STAGE_INVESTIGATION;
     
-    struct user_stats_t empty = {0};
-    empty.last_access_ms = BPF_KTIME_GET_MS();
-    bpf_printk("Enter: GetOrCreateUserStats for UID %u", uid);
-    bpf_map_update_elem(&user_tracker, &uid, &empty, BPF_NOEXIST);
+    
+    //BPF_LOG("Enter: GetOrCreateUserStats for UID %u", uid)
+    bpf_map_update_elem(&user_tracker, &uid, &init_stats, BPF_NOEXIST);
     return bpf_map_lookup_elem(&user_tracker, &uid);
 }
 
@@ -192,30 +171,24 @@ static int CalcEntropy(struct file *file, struct iov_iter *iter, struct fixed_po
     bpf_loop(loop_limit, count_bytes_fast, &ctx, 0);
 
     //print_human_readable(table);
-
- 
     print_preview(s->data_buffer, header_len);
-    
     
     calculate_entropy(table, header_len, entropy_out, 1);
     return 1;
 }
 
-static __always_inline __u8 has_exeeded_normal_open_rate()
+static __always_inline __u8 malicious_open_rate(struct user_stats_t *stats)
 {
-    return 0;
+    run_leaky_bucket(stats);
+    return stats->used_bucket_capacity > BUCKET_CAPACITY ? 1 : 0;
 }
 
-static  __s8 has_malicoud_r_w_ratio(struct user_stats_t *stats)
+static int malicious_read_write_ratio(__s32 total_written, __s32 total_read)
 {
-    struct fixed_point read = { .number = stats->read_count, .q = 0 };
-    struct fixed_point write = { .number = stats->write_count, .q = 0 };
-    struct fixed_point ratio = divide(&read, &write);
-
-    //mach dhier den vergleich mit einem schwellenwert, z.B. wenn mehr als 10 mal so viele writes wie reads, dann return 1, sonst return -1
-    return A_IS_GRATHER_B(&ratio, &RW_RATIO_LOWER_THRESHOLD ) &&
-           A_IS_LESS_B(&ratio, & RW_RATIO_UPPER_THRESHOLD) 
-           ? 1 : -1;
+    struct fixed_point s_index = symmetry_index(total_written, total_read);
+    BPF_LOG("Symmetry index for UID %u: %d/%02d", GET_USER_UID(), total_read, total_written)
+    print_fixed_point("X.XX", &s_index);
+    return A_IS_LESS_OR_EQUAL_B(&s_index, &__symmetriy_index_tollerance) ? -1 : 1;
 }
 
 
@@ -223,35 +196,66 @@ static  __s8 has_malicoud_r_w_ratio(struct user_stats_t *stats)
 static  __s8 has_malicious_entropy_score(struct entropy_data *entropy_data)
 {   
     struct fixed_point avg_entropy = get_avg_entropy(entropy_data);
-    __s8 ret = A_IS_GRATHER_B(&avg_entropy, &ENTROPY_THRESHOLD) == 1 ? 1 : -1;
+    __s8 ret = A_IS_GREATER_OR_EQUAL_B(&avg_entropy, &__entropy_threshold) == 1 ? 1 : -1;
     return ret;
+}
+
+static void reset_user_stats(struct user_stats_t *stats, __s32 prev_thread)
+{
+    switch(prev_thread) 
+    {
+        case STAGE_SCREENING:
+            stats->used_bucket_capacity = 0;
+            stats->open_count = 0;
+            break;
+    
+        case STAGE_INVESTIGATION:
+            stats->read_count = 0;
+            stats->write_count = 0;
+            break;
+            
+        case STAGE_VERDICT:
+            stats->entropy_data.entropy_sum = (struct fixed_point){0};
+            stats->entropy_data.count = 0;
+            break;
+        default:
+            break;
+    }
 }
 
 static int thread_level_decision(struct user_stats_t *stats)
 {
     // cast is premissibale because we only have 3 stages, so the thread_level will never exceed the range of __s8
-    __s8 thread_level = stats->thread_level;
-    switch(thread_level) 
+    int block_decision;
+    __s32 prev_thread_level = stats->thread_level;
+    switch(prev_thread_level) 
     {
         case STAGE_SCREENING:
-            thread_level += has_exeeded_normal_open_rate();
-
+            stats->thread_level += malicious_open_rate(stats);
             break;
     
         case STAGE_INVESTIGATION:
-            thread_level += has_malicoud_r_w_ratio(stats);
+            stats->thread_level += malicious_read_write_ratio(stats->write_count, stats->read_count);
             break;
             
         case STAGE_VERDICT:
-            thread_level += has_malicious_entropy_score(&stats->entropy_data);
+            stats->thread_level += has_malicious_entropy_score(&stats->entropy_data);
             break;
         default:
             break;
     }
-    // Update thread_level safely within the lock
-    stats->thread_level = thread_level;
 
-    return thread_level >= BLOCK_ACTION;
+    if(prev_thread_level != stats->thread_level)
+    {
+        reset_user_stats(stats, prev_thread_level);
+        BPF_LOG("Thread level changed from %d to %d for UID %u", prev_thread_level, stats->thread_level, GET_USER_UID())
+    }
+
+    block_decision = stats->thread_level >= BLOCK_ACTION;
+    if (block_decision)
+        BPF_LOG("block decision: tl=%d, uid=%u", stats->thread_level, GET_USER_UID())
+
+    return block_decision;
 }
 
 static int process_entropy(struct file *file, struct iov_iter *iter, struct entropy_data *entropy_data)
@@ -275,42 +279,36 @@ static int process_entropy(struct file *file, struct iov_iter *iter, struct entr
 
 static int process(struct user_stats_t *stats)
 {
-    bpf_printk("TRY_LOCK_USER_T_OR_SKIP entered %llu", BPF_KTIME_GET_MS());
     if(TRY_LOCK_USER_T_OR_SKIP(stats))
     {
-        bpf_printk("Inside TRY_LOCK_USER_T_OR_SKIP  %llu", BPF_KTIME_GET_MS());
         thread_level_decision(stats);
         stats->last_access_ms = BPF_KTIME_GET_MS();
         UNLOCK_USER_T(stats);
     }
-    bpf_printk("Outside TRY_LOCK_USER_T_OR_SKIP %llu", BPF_KTIME_GET_MS());
     return 0;
 }
 
-static int try_run_detection(struct user_stats_t *stats, int stage_name)
-{
-    // Only collect entropy in VERDICT stage or Skip if decision is already in progress
-    bpf_printk("Enter: SHOULD_SKIP_STAGE_OR_WORKk entered ");
-    if(SHOULD_SKIP_STAGE_OR_WORK(stage_name, stats))
-    {
-        bpf_printk("Skip: SHOULD_SKIP_STAGE_OR_WORKk entered ");
-        bpf_printk("Current thread level: %u", stats->thread_level);
-        bpf_printk("Current stats_lock: %u", stats->stats_lock);
-        bpf_printk("Current last_access_ms: %llu", stats->last_access_ms);
-        bpf_printk("Current time: %llu", BPF_KTIME_GET_MS());
-        return 0;
-    }
 
-    bpf_printk("Pass: SHOULD_SKIP_STAGE_OR_WORKk ");
+//TODO: remove the early return after testing
+static int try_run_or_skip_detection(struct user_stats_t *stats, int stage_name)
+{
+    print_stats(stats, GET_USER_UID());
+    return 0;
+    // Only collect entropy in VERDICT stage or Skip if decision is already in progress
+    if(SHOULD_SKIP_STAGE_OR_WORK(stage_name, stats))
+    {   
+        return 1;
+    }
 
     if(trigger_detector(stats))
     {
-        bpf_printk("Trigger Detector passed -> do detction possibly");
+        BPF_LOG("Trigger Detector stage=%d tl=%u", stage_name, stats->thread_level)
         process(stats);
         return 1;
     }
     return  0;
 }
+
 
 SEC("fentry/vfs_iter_write")
 int BPF_PROG(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
@@ -323,15 +321,13 @@ int BPF_PROG(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
     stats = GetOrCreateUserStats(uid);
     if (!stats)
     {
-        bpf_printk("Failed to get or create user stats for UID %u", uid);
+        BPF_LOG("Failed to get or create user stats for UID %u", uid)
         return 0;
     }
-    if(try_run_detection(stats, STAGE_VERDICT))
+    if(try_run_or_skip_detection(stats, STAGE_VERDICT))
         return 0;
 
-    bpf_printk("Process Entropy: look entered ");
     process_entropy(file, iter, &stats->entropy_data);
-    bpf_printk("Process Entropy: look entered ");
 
     return 0; 
 }
@@ -341,22 +337,22 @@ int BPF_PROG(log_file_permission, struct file *file, int mask)
 {
     if (SHOULD_IGNORE_EVENT(mask)) 
         return 0;
-    bpf_printk("Enter: READ OR WRITE permission check with mask %d", mask);
     struct user_stats_t *stats;
     __u32 uid = GET_USER_UID();
 
     stats = GetOrCreateUserStats(uid);
     if (!stats)
         return 0;
-    
-    if(try_run_detection(stats, STAGE_SCREENING))
+    if(try_run_or_skip_detection(stats, STAGE_INVESTIGATION))
+    {
+        //BPF_LOG("Early return from file_permission for UID %u due to investigation stage", uid)
         return 0;
+    }
 
     // Just count the event in file_permission handler
     // Decision happens in vfs_iter_write_enter with proper locking
-    bpf_printk("Enter: CountEvent  ");
     CountEvent(mask, stats, uid);
-    bpf_printk("Exit: CountEvent  ");
+    print_stats(stats, GET_USER_UID());
     return 0;
 }
 
@@ -366,9 +362,21 @@ int BPF_PROG(lsm_file_open, struct file *file)
     if (!is_nfsd())  // oder dein lokales VFS-Filter
         return 0;
 
-    bpf_printk("open file: %s", file->f_path.dentry->d_name.name);
-    // daten sammeln ...
-    // wenn blocken:
+    struct user_stats_t *stats;
+    __u32 uid = GET_USER_UID();
+    stats = GetOrCreateUserStats(uid);
+    if (!stats)
+        return 0;
+    
+
+    
+    if(try_run_or_skip_detection(stats, STAGE_SCREENING))
+    {
+        //BPF_LOG("Early return from file_open for UID %u due to screening stage", uid)
+        return 0;
+    }
+
+    __sync_fetch_and_add(&stats->open_count, 1);
 
     // sonst:
     return 0;

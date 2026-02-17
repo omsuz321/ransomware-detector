@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# BPF KERNEL CONTROL (mit Auto-Install, loadall & besserem Status)
+# BPF KERNEL CONTROL (Clean-Slate Version)
 # ==========================================
 
 set -e
@@ -25,6 +25,7 @@ NC='\033[0m' # No Color
 log_info()    { echo -e " ℹ️  $1"; }
 log_success() { echo -e " ✅ ${GREEN}$1${NC}"; }
 log_error()   { echo -e " ❌ ${RED}$1${NC}"; }
+log_warn()    { echo -e " ⚠️  ${YELLOW}$1${NC}"; }
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then
@@ -34,61 +35,45 @@ check_root() {
 }
 
 # ==========================================
-# Dependency Check & Installation
+# Dependency Check
 # ==========================================
 install_dependencies() {
-    echo -e "${YELLOW}Folgende Pakete werden installiert:${NC}"
-    echo "  clang llvm libbpf-dev bpftool make linux-tools-$(uname -r) linux-headers-$(uname -r)"
-    echo ""
-    
-    if sudo apt update && sudo apt install -y \
-        clang llvm libbpf-dev bpftool make \
-        linux-tools-$(uname -r) linux-headers-$(uname -r); then
-        log_success "Abhängigkeiten erfolgreich installiert."
-    else
-        log_error "Installation fehlgeschlagen. Bitte manuell prüfen."
-        exit 1
-    fi
+    echo -e "${YELLOW}Installiere notwendige Pakete...${NC}"
+    sudo apt update && sudo apt install -y clang llvm libbpf-dev bpftool make linux-tools-$(uname -r) linux-headers-$(uname -r)
 }
 
 check_dependencies() {
     local missing=0
-    
-    # Prüfe auf wichtige Binaries
     if ! command -v clang &> /dev/null; then missing=1; fi
     if ! command -v bpftool &> /dev/null; then missing=1; fi
     if ! command -v make &> /dev/null; then missing=1; fi
-    
-    # Prüfe auf Kernel Header Ordner
     if [ ! -d "/lib/modules/$(uname -r)/build" ]; then missing=1; fi
 
     if [ $missing -eq 1 ]; then
-        echo -e "${YELLOW}⚠ Es scheinen notwendige Tools (clang, bpftool, Header, ...) zu fehlen.${NC}"
-        echo -n "Sollen diese jetzt installiert werden? [J/n]: "
+        echo -e "${YELLOW}Tools fehlen. Installieren? [J/n]${NC}"
         read -r response
-        
-        # Standard ist Ja bei Enter
-        if [[ -z "$response" || "$response" =~ ^[JjYy]$ ]]; then
-            install_dependencies
-        else
-            log_error "Abbruch. Ohne Tools kann nicht gebaut/geladen werden."
-            exit 1
-        fi
+        [[ -z "$response" || "$response" =~ ^[JjYy]$ ]] && install_dependencies || exit 1
+    fi
+}
+
+ensure_bpffs() {
+    if ! mount | grep -q " /sys/fs/bpf "; then
+        log_info "Mounte /sys/fs/bpf ..."
+        mount -t bpf bpf /sys/fs/bpf
     fi
 }
 
 # ==========================================
-# 1. BUILD (Nur make bpf)
+# 1. BUILD
 # ==========================================
 do_build() {
     check_dependencies
-    
-    echo -e "${BLUE}=== Baue eBPF Objekt (.o) ===${NC}"
+    echo -e "${BLUE}=== Baue eBPF Objekt ===${NC}"
     make clean-bpf || true
     make bpf
     
     if [ -f "$BPF_OBJ" ]; then
-        log_success "Build erfolgreich: $BPF_OBJ erstellt."
+        log_success "Build erfolgreich."
     else
         log_error "Build fehlgeschlagen."
         exit 1
@@ -96,17 +81,55 @@ do_build() {
 }
 
 # ==========================================
-# Hilfsfunktion: bpffs sicherstellen
+# 2. UNLOAD (Mit gründlicher Prüfung)
 # ==========================================
-ensure_bpffs() {
-    if ! mount | grep -q " /sys/fs/bpf "; then
-        log_info "bpffs nicht gemountet, mounte /sys/fs/bpf ..."
-        mount -t bpf bpf /sys/fs/bpf
+do_unload() {
+    check_root
+    echo -e "${BLUE}=== Entlade eBPF Programme ===${NC}"
+
+    local checks_failed=0
+
+    # 1. Pins entfernen
+    if [ -d "$PIN_DIR" ]; then
+        rm -rf "$PIN_DIR"
+        log_success "Pin-Verzeichnis gelöscht ($PIN_DIR)."
+    else
+        log_info "Kein Pin-Verzeichnis gefunden (schon sauber?)."
+    fi
+
+    # 2. Prüfen auf "Geister"-Maps (Zombie Maps)
+    # Maps bleiben im Speicher, wenn ein Userspace-Programm (Reader) noch läuft!
+    if command -v bpftool &> /dev/null; then
+        # Wir schauen, ob noch Maps geladen sind, die zum Objekt passen könnten.
+        # Hinweis: Das ist eine Heuristik. Wir suchen nach Maps ohne Pin-Pfad.
+        
+        # Kurze Pause für den Kernel (RCU cleanup)
+        sleep 0.2
+        
+        # Check: Gibt es noch Programme, die 'vfs_write' im Namen haben?
+        if bpftool prog show | grep -q "vfs_write"; then
+            log_warn "ACHTUNG: Es scheinen noch BPF-Programme im Kernel zu hängen!"
+            log_warn "         Grund: Wahrscheinlich läuft noch ein Trace/Log-Reader."
+            log_warn "         Bitte beende alle Reader-Prozesse (z.B. Strg+C im anderen Fenster)."
+            checks_failed=1
+        elif bpftool map show | grep -q "vfs_write"; then
+            log_warn "ACHTUNG: Die BPF-Maps sind noch im Speicher (Ref-Count > 0)."
+            log_warn "         Grund: Ein offenes Programm hält die Map fest."
+            checks_failed=1
+        else
+            log_success "Kernel ist sauber. Alle Maps und Programme entfernt."
+        fi
+    fi
+
+    if [ $checks_failed -eq 1 ]; then
+        return 1 # Return code failure signalisieren
+    else
+        return 0
     fi
 }
 
 # ==========================================
-# 2. LOAD (In den Kernel laden & pinnen)
+# 3. LOAD (Clean Slate)
 # ==========================================
 do_load() {
     check_root
@@ -114,56 +137,28 @@ do_load() {
     ensure_bpffs
 
     if [ ! -f "$BPF_OBJ" ]; then
-        log_info "Objekt $BPF_OBJ nicht gefunden. Starte Build..."
         do_build
     fi
 
-    # Prüfen, ob schon etwas unter PIN_DIR gepinnt ist
-    if command -v bpftool &> /dev/null; then
-        if bpftool prog show | grep -q "$PIN_DIR" ; then
-            log_info "Programm(e) scheinen bereits geladen zu sein (Pins unter $PIN_DIR gefunden)."
-            do_status
-            exit 0
-        fi
+    # ZWANGS-BEREINIGUNG:
+    # Wir rufen unload auf, auch wenn wir denken, es ist nichts da.
+    # Das stellt sicher, dass wir bei 0 anfangen (leere Maps).
+    if [ -d "$PIN_DIR" ]; then
+        log_info "Alter Zustand erkannt. Führe Reset durch..."
+        do_unload || log_warn "Konnte alte Instanz nicht vollständig entfernen (siehe oben)."
     fi
 
-    echo -e "${BLUE}=== Lade eBPF Programme in den Kernel (loadall) ===${NC}"
+    echo -e "${BLUE}=== Lade eBPF Programme (Neustart) ===${NC}"
     mkdir -p "$PIN_DIR"
 
-    # loadall: lädt ALLE Programme aus dem Objekt & pinnt sie im Verzeichnis
+    # Loadall erstellt neue Maps, da der Pfad frisch ist
     if bpftool prog loadall "$BPF_OBJ" "$PIN_DIR" autoattach; then
-        log_success "eBPF Programme erfolgreich geladen und (auto)attached."
-        echo "   (Programme sind jetzt unter $PIN_DIR gepinnt)"
+        log_success "Programme geladen und Maps neu initialisiert."
+        echo -e "   📍 Pinned unter: $PIN_DIR"
     else
-        log_error "Fehler beim Laden mit bpftool (loadall)."
+        log_error "Fehler beim Laden."
         rmdir "$PIN_DIR" 2>/dev/null || true
         exit 1
-    fi
-}
-
-# ==========================================
-# 3. UNLOAD (Entfernen)
-# ==========================================
-do_unload() {
-    check_root
-    
-    echo -e "${BLUE}=== Entlade eBPF Programme ===${NC}"
-
-    if [ -d "$PIN_DIR" ]; then
-        rm -rf "$PIN_DIR"
-        log_success "Pins entfernt (Pin-Dir gelöscht: $PIN_DIR)."
-    else
-        log_info "Kein Pin-Dir gefunden, nichts zu entfernen."
-    fi
-    
-    # Sicherheitscheck: hängt noch irgendwas unter diesem Pfad?
-    if command -v bpftool &> /dev/null; then
-        if bpftool prog show | grep -q "$PIN_DIR" ; then
-            echo -e "${YELLOW}Warnung: Es scheinen noch Reste im Kernel zu sein (Pins mit $PIN_DIR im Pfad).${NC}"
-            bpftool prog show | grep "$PIN_DIR" || true
-        else
-            log_info "Keine weiteren Programme mit Pfad $PIN_DIR gefunden."
-        fi
     fi
 }
 
@@ -173,19 +168,15 @@ do_unload() {
 do_status() {
     echo -e "${BLUE}=== Status ===${NC}"
     
-    if ! command -v bpftool &> /dev/null; then
-        echo -e "${YELLOW}bpftool nicht installiert, kann keinen Status anzeigen.${NC}"
-        return
-    fi
-
-    # Prüfen, ob Programme unter PIN_DIR gepinnt sind
-    if bpftool prog show | grep -q "$PIN_DIR" ; then
-        echo -e "${GREEN}Status: GELADEN (Programme unter $PIN_DIR gepinnt)${NC}"
-        echo ""
-        echo "Details (bpftool):"
-        bpftool prog show | grep "$PIN_DIR" || echo "Konnte Details nicht lesen."
+    if [ -d "$PIN_DIR" ]; then
+        echo -e "${GREEN}Status: AKTIV (Pinned)${NC}"
+        echo "--------------------------------"
+        bpftool prog show | grep -C 1 "$PIN_DIR" || echo "Keine Details lesbar."
+        echo "--------------------------------"
+        echo -e "Maps:"
+        bpftool map show | grep -C 1 "$PIN_DIR" || echo "Keine Maps gefunden (ungewöhnlich)."
     else
-        echo -e "${YELLOW}Status: NICHT GELADEN (keine Pins unter $PIN_DIR gefunden)${NC}"
+        echo -e "${YELLOW}Status: INAKTIV (Nicht geladen)${NC}"
     fi
 }
 
