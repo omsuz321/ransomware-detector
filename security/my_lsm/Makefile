@@ -6,9 +6,8 @@ GCC     ?= gcc
 
 # BPF Compiler Flags
 BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -D__BPF__ \
-    -I/work/include \
-    -I$(PWD)/include \
-    -I$(PWD)/src
+	-I$(PWD)/include \
+	-I$(PWD)/src
 
 # GCC Userspace Flags
 USERSPACE_CFLAGS = -O2 -g -Wall
