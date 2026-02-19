@@ -68,51 +68,6 @@ int BPF_PROG(on_open, struct file *file)
     return 0;
 }
 
-// READ bytes via fentry/vfs_iter_read
-SEC("fentry/vfs_iter_read")
-int BPF_PROG(on_vfs_iter_read, struct file *file, struct iov_iter *iter,
-             loff_t *ppos, rwf_t flags)
-{
-    if (!is_nfsd())
-        return 0;
-    
-    __u64 cnt = BPF_CORE_READ(iter, count);
-    bpf_printk("[HOOK] fentry/vfs_iter_read count=%llu", cnt);
-    if (!submit_evt(FILEOPS_OP_READ, cnt)) {    
-        bpf_printk("[ERROR] Failed to submit read event");
-    }
-    return 0;
-}
-
-SEC("fentry/vfs_splice_read")
-int BPF_PROG(on_vfs_splice_read, struct file *in, loff_t *ppos,
-             struct pipe_inode_info *pipe, size_t len, unsigned int flags)
-{
-    if (!is_nfsd())
-        return 0;
-    
-    bpf_printk("[HOOK] fentry/vfs_splice_read len=%zu", len);
-    if (!submit_evt(FILEOPS_OP_READ, (__u64)len)) {
-        bpf_printk("[ERROR] Failed to submit splice read event");
-    }
-    return 0;
-}
-
-
-// WRITE bytes via fentry/vfs_iter_write
-SEC("fentry/vfs_iter_write")
-int BPF_PROG(on_vfs_iter_write, struct file *file, struct iov_iter *iter)
-{
-    if (!is_nfsd())
-        return 0;
-    
-    __u64 cnt = BPF_CORE_READ(iter, count);
-    bpf_printk("[HOOK] fentry/vfs_iter_write count=%llu", cnt);
-    if (!submit_evt(FILEOPS_OP_WRITE, cnt)) {
-        bpf_printk("[ERROR] Failed to submit write event");
-    }
-    return 0;
-}
 
 SEC("lsm/file_permission")
 int BPF_PROG(log_file_permission, struct file *file, int mask)
