@@ -66,8 +66,18 @@ ensure_bpffs() {
 }
 
 # ==========================================
-# 1. BUILD
+# 1. BUILD & CLEAN
 # ==========================================
+do_clean() {
+    echo -e "${BLUE}=== Räume Build-Dateien auf (Clean) ===${NC}"
+    if command -v make &> /dev/null; then
+        make clean-monitor
+        log_success "Aufräumen erfolgreich."
+    else
+        log_warn "'make' nicht gefunden, überspringe clean."
+    fi
+}
+
 do_build() {
     check_dependencies
     echo -e "${BLUE}=== Baue Fileops Monitor BPF + Userspace ===${NC}"
@@ -89,7 +99,12 @@ do_unload() {
     check_root
     echo -e "${BLUE}=== Entlade BPF Programme ===${NC}"
 
-    # Pin-Verzeichnis entfernen
+    if pgrep -f "fileops_logger" > /dev/null; then
+        log_info "Beende verbleibende Logger-Prozesse..."
+        pkill -f "fileops_logger" || true
+        sleep 0.5
+    fi
+
     if [ -d "$PIN_DIR" ]; then
         rm -rf "$PIN_DIR"
         log_success "Pin-Verzeichnis gelöscht ($PIN_DIR)."
@@ -97,10 +112,8 @@ do_unload() {
         log_info "Kein Pin-Verzeichnis gefunden (schon sauber?)."
     fi
 
-    # Kurze Pause für RCU cleanup
     sleep 0.2
 
-    # Prüfe auf verbleibende Programme
     if command -v bpftool &> /dev/null; then
         if bpftool prog show | grep -q "fileops_lsm"; then
             log_warn "Warnung: BPF-Programme noch aktiv (ein Logger läuft noch?)."
@@ -109,7 +122,6 @@ do_unload() {
             log_success "Kernel ist sauber."
         fi
     fi
-
     return 0
 }
 
@@ -118,13 +130,13 @@ do_unload() {
 # ==========================================
 do_load() {
     check_root
+    check_dependencies
     ensure_bpffs
 
-    if [ ! -f "$MONITOR_BPF_OBJ" ]; then
-        do_build
-    fi
+    # IMMER neu bauen bei "load" (Korrektur integriert)
+    echo -e "${BLUE}=== Erzwinge Neu-Bauen vor dem Laden ===${NC}"
+    do_build
 
-    # Cleanup: alte Instanz entfernen
     if [ -d "$PIN_DIR" ]; then
         log_info "Alter Zustand erkannt. Führe Reset durch..."
         do_unload || log_warn "Konnte alte Instanz nicht vollständig entfernen."
@@ -144,7 +156,7 @@ do_load() {
 }
 
 # ==========================================
-# 4. RUN (Build + Load + Start Logger)
+# 4. RUN (Build + Start Logger via Skeleton)
 # ==========================================
 do_run() {
     check_root
@@ -153,7 +165,6 @@ do_run() {
     local output="/var/log/nfs_fileops.csv"
     local ring_mb=256
 
-    # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
             -o|--output)
@@ -172,25 +183,21 @@ do_run() {
         esac
     done
 
-    # Build
     do_build
 
-    # Load BPF
-    do_load
+    log_info "Setze alten Zustand zurück..."
+    do_unload || true
 
-    # Check if logger binary exists
     if [ ! -f "$MONITOR_LOG_BIN" ]; then
         log_error "Logger binary nicht gefunden: $MONITOR_LOG_BIN"
         exit 1
     fi
 
-    # Ensure log directory exists
     log_dir=$(dirname "$output")
     if [ ! -d "$log_dir" ]; then
         mkdir -p "$log_dir"
     fi
 
-    # Start logger with Ctrl+C handling
     echo -e "${BLUE}=== Starte Logger ===${NC}"
     log_success "CSV wird geschrieben zu: $output"
     log_info "Drücke Ctrl+C zum Stoppen..."
@@ -199,10 +206,8 @@ do_run() {
     local logger_args="-o $output"
     [ "$ring_mb" != "256" ] && logger_args="$logger_args --ring-mb $ring_mb"
 
-    # Run logger (will exit on Ctrl+C)
     "$MONITOR_LOG_BIN" $logger_args
 
-    # Cleanup after logger stops
     echo ""
     log_info "Logger gestoppt. Entlade BPF..."
     do_unload || true
@@ -233,13 +238,14 @@ do_status() {
 # ==========================================
 usage() {
     cat << EOF
-Usage: sudo $0 {build|load|unload|run|status|help}
+Usage: sudo $0 {build|clean|load|unload|run|status|help}
 
 Commands:
   build              Build BPF + Userspace binaries only
+  clean              Räumt die Build-Dateien auf (make clean)
   load               Load BPF programmes into kernel
   unload             Unload BPF programmes from kernel
-  run [opts]         Build + Load + Start logger (full pipeline)
+  run [opts]         Build + Start logger (logger loads/attaches BPF)
   status             Show current monitor status
 
 Run options:
@@ -247,7 +253,7 @@ Run options:
   --ring-mb N        Ringbuffer size in MiB (default: 256)
 
 Examples:
-  sudo $0 build
+  sudo $0 clean
   sudo $0 run
   sudo $0 run -o /tmp/fileops.csv --ring-mb 512
 
@@ -256,6 +262,7 @@ EOF
 
 case "${1:-}" in
     build)  do_build ;;
+    clean)  do_clean ;;  # NEU
     load)   do_load ;;
     unload) do_unload ;;
     run)    shift; do_run "$@" ;;

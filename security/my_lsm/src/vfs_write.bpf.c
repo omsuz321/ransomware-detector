@@ -14,26 +14,12 @@
 
 
 
-#define INTERVAL_MS 500ULL
-
-// Stage 1: Screening (Rasterfahndung)
-#define STAGE_SCREENING   0  
-// Stage 2: Investigation (Beweissicherung)
-#define STAGE_INVESTIGATION     1  
-// Stage 3: Verdict (Urteilsfindung)
-#define STAGE_VERDICT 2  
-#define BLOCK_ACTION 3
-
-#define SCREENING_INTERVAL_MS 1000ULL
-#define INVESTIGATION_INTERVAL_MS 2000ULL
-#define VERDICT_INTERVAL_MS 3000ULL
-
 
 #define SHOULD_IGNORE_EVENT(mask) ( !is_nfsd() || (mask != MAY_READ && mask != MAY_WRITE) )
 // the ordr matters, as wthing the region that we lock, we also update hte thread:level, thus ensureing, that we oyuls only 
 // do the decision logic for one thread, because only one thread would have updated the thread level, the other ones would see that the thread level is already updated and skip the decision logic, even if they also triggered the time based trigger
 #define SHOULD_SKIP_STAGE_OR_WORK(stage, stats) (stats->stats_lock == 1 || stats->thread_level != stage)
-#define GET_USER_UID() (__u32)bpf_get_current_uid_gid()
+
 //if true, someone else has the lock
 #define TRY_LOCK_USER_T_OR_SKIP(stats) (__sync_val_compare_and_swap(&stats->stats_lock, 0, 1) == 0)
 //if ture, user was successfully unlocked
@@ -72,19 +58,20 @@ struct {
     __type(value, struct user_stats_t);
 } user_tracker SEC(".maps");
 
+
 // it can only be one of them. therefore i can use jus t one lock for both the thread level and the last access time, because only the thread that updaets the thread level would also update the last access time, thus ensuring that we have a consistent view of the thread level and the last access time, because if another thread has updated the thread level, then we know that it has also updated the last access time, thus we can use the last access time to determine whether we should do the decision logic or not
 static void CountEvent(int mask, struct user_stats_t *stats, __u32 uid)
 {
-    bpf_printk("mask: %d", mask);
+    BPF_LOG("mask: %d", mask);
     if (mask == MAY_WRITE)
     {
-        bpf_printk("enter write");
+        BPF_LOG("enter write");
         __sync_fetch_and_add(&stats->write_count, 1);
         return;
     }
     else if (mask == MAY_READ)
     {
-        bpf_printk("enter read");
+        BPF_LOG("enter read");
         __sync_fetch_and_add(&stats->read_count, 1);
     }
 }
@@ -96,8 +83,8 @@ static int trigger_detector(struct user_stats_t *stats)
 
     switch(stats->thread_level)
     {
-        case STAGE_SCREENING:
-            return now - stats->last_access_ms >= SCREENING_INTERVAL_MS; 
+        //case STAGE_SCREENING:
+        //    return now - stats->last_access_ms >= SCREENING_INTERVAL_MS; 
         case STAGE_INVESTIGATION:
             return now - stats->last_access_ms >= INVESTIGATION_INTERVAL_MS; 
         case STAGE_VERDICT:
@@ -144,51 +131,20 @@ static struct user_stats_t *GetOrCreateUserStats(__u32 uid)
     return bpf_map_lookup_elem(&user_tracker, &uid);
 }
 
-static int CalcEntropy(struct file *file, struct iov_iter *iter, struct fixed_point *entropy_out)
-{
-    int key = 0;
-    struct scratch_t *s = bpf_map_lookup_elem(&scratch_map, &key);
-    if (!s) 
-        return 0;
 
-    u64 bytes_to_send = fill_write_event(s, file, iter);
-    if (bytes_to_send == 0)
-        return 0;
 
-    struct freq_table *table = bpf_map_lookup_elem(&byte_counts, &key);
-    __u32 header_len = s->header.len;
-    
-    if (!table || header_len == 0) 
-        return 0;
-
-    struct count_ctx ctx = {
-        .table = table,
-        .data_buffer = s->data_buffer
-    };
-
-    __u32 loop_limit = header_len > MAX_DATA_SIZE ? MAX_DATA_SIZE : header_len;
-
-    bpf_loop(loop_limit, count_bytes_fast, &ctx, 0);
-
-    //print_human_readable(table);
-    print_preview(s->data_buffer, header_len);
-    
-    calculate_entropy(table, header_len, entropy_out, 1);
-    return 1;
-}
-
-static __always_inline __u8 malicious_open_rate(struct user_stats_t *stats)
-{
-    run_leaky_bucket(stats);
-    return stats->used_bucket_capacity > BUCKET_CAPACITY ? 1 : 0;
-}
+//static __always_inline __u8 malicious_open_rate(struct user_stats_t *stats)
+//{
+//    run_leaky_bucket(stats);
+//    return stats->used_bucket_capacity > BUCKET_CAPACITY ? 1 : 0;
+//}
 
 static int malicious_read_write_ratio(__s32 total_written, __s32 total_read)
 {
     struct fixed_point s_index = symmetry_index(total_written, total_read);
     BPF_LOG("Symmetry index for UID %u: %d/%02d", GET_USER_UID(), total_read, total_written)
     print_fixed_point("X.XX", &s_index);
-    return A_IS_LESS_OR_EQUAL_B(&s_index, &__symmetriy_index_tollerance) ? -1 : 1;
+    return A_IS_LESS_OR_EQUAL_B(&s_index, &__symmetriy_index_tollerance) ? 1 : 0;
 }
 
 
@@ -204,10 +160,10 @@ static void reset_user_stats(struct user_stats_t *stats, __s32 prev_thread)
 {
     switch(prev_thread) 
     {
-        case STAGE_SCREENING:
-            stats->used_bucket_capacity = 0;
-            stats->open_count = 0;
-            break;
+       // case STAGE_SCREENING:
+       //     stats->used_bucket_capacity = 0;
+       //     stats->open_count = 0;
+       //     break;
     
         case STAGE_INVESTIGATION:
             stats->read_count = 0;
@@ -230,9 +186,9 @@ static int thread_level_decision(struct user_stats_t *stats)
     __s32 prev_thread_level = stats->thread_level;
     switch(prev_thread_level) 
     {
-        case STAGE_SCREENING:
-            stats->thread_level += malicious_open_rate(stats);
-            break;
+        //case STAGE_SCREENING:
+        //    stats->thread_level += malicious_open_rate(stats);
+        //    break;
     
         case STAGE_INVESTIGATION:
             stats->thread_level += malicious_read_write_ratio(stats->write_count, stats->read_count);
@@ -261,9 +217,20 @@ static int thread_level_decision(struct user_stats_t *stats)
 static int process_entropy(struct file *file, struct iov_iter *iter, struct entropy_data *entropy_data)
 {
     struct fixed_point local_entropy;
-    if(!CalcEntropy(file, iter, &local_entropy))
-        return 1;
 
+    int key = 0;
+    struct scratch_t *s = bpf_map_lookup_elem(&scratch_map, &key);
+    if (!s) 
+        return 0;
+
+    u64 bytes_to_send = fill_write_event(s, file, iter);
+    if (bytes_to_send == 0)
+        return 0;
+
+    struct freq_table *table = bpf_map_lookup_elem(&byte_counts, &key);
+    
+    if(!CalcEntropy(s, table, &local_entropy))
+        return 1;
     struct fixed_point *entropy_sum_ptr = &entropy_data->entropy_sum;
 
     // this makes it thread safe when updateing
@@ -292,8 +259,6 @@ static int process(struct user_stats_t *stats)
 //TODO: remove the early return after testing
 static int try_run_or_skip_detection(struct user_stats_t *stats, int stage_name)
 {
-    print_stats(stats, GET_USER_UID());
-    return 0;
     // Only collect entropy in VERDICT stage or Skip if decision is already in progress
     if(SHOULD_SKIP_STAGE_OR_WORK(stage_name, stats))
     {   
@@ -314,7 +279,9 @@ SEC("fentry/vfs_iter_write")
 int BPF_PROG(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
 {
     if (!is_nfsd()) 
-        return 0;
+    return 0;
+
+    BPF_LOG("enter write")
     struct user_stats_t *stats;
     __u32 uid = GET_USER_UID();
 
@@ -328,7 +295,7 @@ int BPF_PROG(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
         return 0;
 
     process_entropy(file, iter, &stats->entropy_data);
-
+    BPF_LOG("entropy")
     return 0; 
 }
 
@@ -339,10 +306,16 @@ int BPF_PROG(log_file_permission, struct file *file, int mask)
         return 0;
     struct user_stats_t *stats;
     __u32 uid = GET_USER_UID();
-
     stats = GetOrCreateUserStats(uid);
     if (!stats)
+    {
+        BPF_LOG("Failed to get or create user stats for UID %u", uid)
         return 0;
+
+    }
+
+    if(stats->thread_level == BLOCK_ACTION)
+        return -EACCES;
     if(try_run_or_skip_detection(stats, STAGE_INVESTIGATION))
     {
         //BPF_LOG("Early return from file_permission for UID %u due to investigation stage", uid)
@@ -359,24 +332,33 @@ int BPF_PROG(log_file_permission, struct file *file, int mask)
 SEC("lsm/file_open")
 int BPF_PROG(lsm_file_open, struct file *file)
 {
-    if (!is_nfsd())  // oder dein lokales VFS-Filter
-        return 0;
 
+    if (!is_nfsd())  // oder dein lokales VFS-Filter
+      return 0;
+    
+    BPF_LOG("OPEN")
     struct user_stats_t *stats;
     __u32 uid = GET_USER_UID();
     stats = GetOrCreateUserStats(uid);
     if (!stats)
-        return 0;
-    
-
-    
-    if(try_run_or_skip_detection(stats, STAGE_SCREENING))
     {
-        //BPF_LOG("Early return from file_open for UID %u due to screening stage", uid)
+        BPF_LOG("Failed to get or create user stats for UID %u", uid)
         return 0;
-    }
 
-    __sync_fetch_and_add(&stats->open_count, 1);
+    }
+    
+    if(stats->thread_level == BLOCK_ACTION)
+        return -EACCES;
+
+    
+    //if(try_run_or_skip_detection(stats, STAGE_SCREENING))
+    //{
+    //    //BPF_LOG("Early return from file_open for UID %u due to screening stage", uid)
+    //   return 0;
+    //}
+
+    //TODO: remove this as the end
+    //__sync_fetch_and_add(&stats->open_count, 1);
 
     // sonst:
     return 0;

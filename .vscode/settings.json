@@ -1,0 +1,5 @@
+{
+    "clangd.arguments": [
+        "--compile-commands-dir=/work/security/my_lsm"
+    ]
+}

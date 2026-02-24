@@ -64,8 +64,18 @@ ensure_bpffs() {
 }
 
 # ==========================================
-# 1. BUILD
+# 1. BUILD & CLEAN
 # ==========================================
+do_clean() {
+    echo -e "${BLUE}=== Räume Build-Dateien auf (Clean) ===${NC}"
+    if command -v make &> /dev/null; then
+        make clean-bpf
+        log_success "Aufräumen erfolgreich."
+    else
+        log_warn "'make' nicht gefunden, überspringe clean."
+    fi
+}
+
 do_build() {
     check_dependencies
     echo -e "${BLUE}=== Baue eBPF Objekt ===${NC}"
@@ -98,23 +108,13 @@ do_unload() {
     fi
 
     # 2. Prüfen auf "Geister"-Maps (Zombie Maps)
-    # Maps bleiben im Speicher, wenn ein Userspace-Programm (Reader) noch läuft!
     if command -v bpftool &> /dev/null; then
-        # Wir schauen, ob noch Maps geladen sind, die zum Objekt passen könnten.
-        # Hinweis: Das ist eine Heuristik. Wir suchen nach Maps ohne Pin-Pfad.
-        
-        # Kurze Pause für den Kernel (RCU cleanup)
         sleep 0.2
-        
-        # Check: Gibt es noch Programme, die 'vfs_write' im Namen haben?
         if bpftool prog show | grep -q "vfs_write"; then
             log_warn "ACHTUNG: Es scheinen noch BPF-Programme im Kernel zu hängen!"
-            log_warn "         Grund: Wahrscheinlich läuft noch ein Trace/Log-Reader."
-            log_warn "         Bitte beende alle Reader-Prozesse (z.B. Strg+C im anderen Fenster)."
             checks_failed=1
         elif bpftool map show | grep -q "vfs_write"; then
             log_warn "ACHTUNG: Die BPF-Maps sind noch im Speicher (Ref-Count > 0)."
-            log_warn "         Grund: Ein offenes Programm hält die Map fest."
             checks_failed=1
         else
             log_success "Kernel ist sauber. Alle Maps und Programme entfernt."
@@ -122,7 +122,7 @@ do_unload() {
     fi
 
     if [ $checks_failed -eq 1 ]; then
-        return 1 # Return code failure signalisieren
+        return 1 
     else
         return 0
     fi
@@ -136,13 +136,11 @@ do_load() {
     check_dependencies
     ensure_bpffs
 
-    if [ ! -f "$BPF_OBJ" ]; then
-        do_build
-    fi
+    # IMMER neu bauen bei "load" (Korrektur integriert)
+    echo -e "${BLUE}=== Erzwinge Neu-Bauen vor dem Laden ===${NC}"
+    do_build
 
-    # ZWANGS-BEREINIGUNG:
-    # Wir rufen unload auf, auch wenn wir denken, es ist nichts da.
-    # Das stellt sicher, dass wir bei 0 anfangen (leere Maps).
+    # ZWANGS-BEREINIGUNG
     if [ -d "$PIN_DIR" ]; then
         log_info "Alter Zustand erkannt. Führe Reset durch..."
         do_unload || log_warn "Konnte alte Instanz nicht vollständig entfernen (siehe oben)."
@@ -151,7 +149,6 @@ do_load() {
     echo -e "${BLUE}=== Lade eBPF Programme (Neustart) ===${NC}"
     mkdir -p "$PIN_DIR"
 
-    # Loadall erstellt neue Maps, da der Pfad frisch ist
     if bpftool prog loadall "$BPF_OBJ" "$PIN_DIR" autoattach; then
         log_success "Programme geladen und Maps neu initialisiert."
         echo -e "   📍 Pinned unter: $PIN_DIR"
@@ -185,8 +182,9 @@ do_status() {
 # ==========================================
 case "${1:-}" in
     build)  do_build ;;
+    clean)  do_clean ;;  # NEU
     load)   do_load ;;
     unload) do_unload ;;
     status) do_status ;;
-    help|*) echo "Usage: sudo $0 {build|load|unload|status}"; exit 1 ;;
+    help|*) echo "Usage: sudo $0 {build|clean|load|unload|status}"; exit 1 ;;
 esac

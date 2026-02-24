@@ -5,8 +5,9 @@
 #include "common.h"
 #endif
 
+
 #ifndef __VMLINUX_H__
-#include <vmlinux.h>
+#include "vmlinux.h"
 #endif
 
 #ifndef __BPF_HELPERS_
@@ -17,53 +18,8 @@
 #include <bpf/bpf_core_read.h>
 #endif
 
-#ifndef AIRBAG_SIZE
-#define AIRBAG_SIZE (MAX_DATA_SIZE * 2)
-#endif
 
-#ifndef UIO_MAXIOV
-#define UIO_MAXIOV 1024
-#endif
 
-/* * Struct definitions 
- * Split header and payload to satisfy BPF verifier constraints regarding
- * variable-sized access and map value sizes.
- */
-
-struct write_event_hdr {
-    __u32 pid;
-    __u32 uid;
-    __u32 len;          
-    __u64 requested;    
-    char  fname[256];
-};
-
-struct write_event {
-    struct write_event_hdr hdr;
-    __u8  data[]; 
-};
-
-#ifndef SCRATCH_MAP_SIZE
-#define SCRATCH_MAP_SIZE (sizeof(struct write_event_hdr) + AIRBAG_SIZE)
-#endif
-
-struct scratch_t {
-    struct write_event_hdr header;
-    __u8 data_buffer[AIRBAG_SIZE];
-};
-
-struct count_ctx {
-    struct freq_table *table;
-    __u8 *data_buffer;
-};
-
-struct copy_ctx {
-    struct scratch_t *scratch;
-    struct iov_iter *iter;
-    size_t current_seg_offset;
-    size_t total_requested;
-    __u32 bytes_copied;
-};
 
 /* Helper functions */
 
@@ -119,13 +75,7 @@ static long loop_callback_rest(__u32 i, struct copy_ctx *ctx)
     return copy_single_segment(i + 1, ctx);
 }
 
-static long count_bytes_fast(__u32 i, struct count_ctx *ctx)
-{   
-    if (i >= MAX_DATA_SIZE) return 0;
-    __u8 byte_val = ctx->data_buffer[i];
-    ctx->table->counts[byte_val]++;
-    return 0;
-}
+
 
 /* Main logic */
 

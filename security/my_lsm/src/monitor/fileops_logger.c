@@ -7,6 +7,7 @@
 #include <time.h>
 #include <errno.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/resource.h>
 
 #include "fileops_common.h"
@@ -41,6 +42,56 @@ static __u64 ts_to_ns(const struct timespec *ts)
     return (__u64)ts->tv_sec * 1000000000ULL + (__u64)ts->tv_nsec;
 }
 
+static void fp_wire_to_str_4dp(const struct fp_wire *fp, char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!fp) {
+        return;
+    }
+
+    int64_t raw = (int64_t)fp->number;
+    uint32_t q = fp->q;
+    if (q > 31) {
+        q = 31;
+    }
+
+    uint64_t mag = (raw < 0) ? (uint64_t)(-raw) : (uint64_t)raw;
+    uint64_t int_part = (q == 0) ? mag : (mag >> q);
+    uint64_t frac_bits = (q == 0) ? 0ULL : (mag & ((1ULL << q) - 1ULL));
+    uint64_t dec4 = (q == 0) ? 0ULL : ((frac_bits * 10000ULL) >> q);
+    if (dec4 > 9999ULL) {
+        dec4 = dec4 % 10000ULL;
+    }
+
+    char sign = (raw < 0 && (int_part != 0 || dec4 != 0)) ? '-' : '\0';
+
+    if (dec4 == 0) {
+        if (sign) {
+            snprintf(out, out_sz, "-%llu", (unsigned long long)int_part);
+        } else {
+            snprintf(out, out_sz, "%llu", (unsigned long long)int_part);
+        }
+        return;
+    }
+
+    char frac[5];
+    snprintf(frac, sizeof(frac), "%04u", (unsigned int)dec4);
+    int end = 3;
+    while (end >= 0 && frac[end] == '0') {
+        frac[end] = '\0';
+        end--;
+    }
+
+    if (sign) {
+        snprintf(out, out_sz, "-%llu.%s", (unsigned long long)int_part, frac);
+    } else {
+        snprintf(out, out_sz, "%llu.%s", (unsigned long long)int_part, frac);
+    }
+}
+
 struct ctx {
     FILE *out;
 
@@ -67,13 +118,19 @@ static int handle_event(void *ctxv, void *data, size_t len)
     char tbuf[64];
     strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S", &tm);
 
-        // CSV columns:
-        // timestamp,uid,tgid,pid,op,bytes
-        fprintf(c->out, "%s.%09ldZ,%u,%u,%u,%s,%llu\n",
+    char entropy_buf[32] = "";
+    if (e->entropy_valid) {
+        fp_wire_to_str_4dp(&e->entropy, entropy_buf, sizeof(entropy_buf));
+    }
+
+    // CSV columns:
+    // timestamp,uid,tgid,pid,op,bytes,entropy
+    fprintf(c->out, "%s.%09ldZ,%u,%u,%u,%s,%llu,%s\n",
             tbuf, nsec,
             e->uid, e->tgid, e->pid,
             op_str(e->op),
-            (unsigned long long)e->bytes);
+            (unsigned long long)e->bytes,
+            entropy_buf);
 
     return 0;
 }
@@ -121,7 +178,7 @@ int main(int argc, char **argv)
     fseek(out, 0, SEEK_END);
     long sz = ftell(out);
     if (sz == 0) {
-        fprintf(out, "timestamp,uid,tgid,pid,op,bytes\n");
+        fprintf(out, "timestamp,uid,tgid,pid,op,bytes,entropy\n");
         fflush(out);
     }
 

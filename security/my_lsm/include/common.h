@@ -10,7 +10,7 @@
     #include "compat.h"
 #else
     #ifndef __VMLINUX_H__
-    #include <vmlinux.h>
+    #include "vmlinux.h"
     #endif
     
     #ifndef __BPF_HELPERS_H__
@@ -34,6 +34,48 @@
 #define RW_SYMMERTY_TOLLERANCE ((struct fixed_point ) { .number = 15, .q = 1 })
 #define ENTROPY_THRESHOLD ((struct fixed_point ) { .number = 15, .q = 1 })// 7.5 in decinal, equelas 111.1 in binary, this means afteer the shit we have 1111.0, ,wthile the number before is 8 and bumber of shifts is 1
 
+#define EPERM   1  /* Operation not permitted (Fehlende Rechte/Root) */
+#define ENOENT  2  /* No such file or directory (Datei existiert nicht) */
+#define EACCES  13 /* Permission denied (Zugriff vom LSM verweigert) */
+#define EINVAL  22 /* Invalid argument (Falsche Parameter) */
+
+
+
+
+
+#ifndef AIRBAG_SIZE
+#define AIRBAG_SIZE (MAX_DATA_SIZE * 2)
+#endif
+
+#ifndef UIO_MAXIOV
+#define UIO_MAXIOV 1024
+#endif
+
+/* * Struct definitions 
+ * Split header and payload to satisfy BPF verifier constraints regarding
+ * variable-sized access and map value sizes.
+ */
+
+
+
+#ifndef SCRATCH_MAP_SIZE
+#define SCRATCH_MAP_SIZE (sizeof(struct write_event_hdr) + AIRBAG_SIZE)
+#endif
+
+
+// Stage 1: Screening (Rasterfahndung)
+//#define STAGE_SCREENING   0  
+// Stage 2: Investigation (Beweissicherung)
+#define STAGE_INVESTIGATION     1  
+// Stage 3: Verdict (Urteilsfindung)
+#define STAGE_VERDICT 2  
+#define BLOCK_ACTION 3
+
+//#define SCREENING_INTERVAL_MS 1000ULL
+#define INVESTIGATION_INTERVAL_MS 1000ULL
+#define VERDICT_INTERVAL_MS 1000ULL
+
+
 
 #ifndef is_signed_type
 #define is_signed_type(type) (((type)(-1)) < (type)1)
@@ -41,9 +83,11 @@
 
 #define NFSD_MAGIC (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? 0x6473666E : 0x6E667364)
 
+#define BPF_KTIME_GET_MS() (bpf_ktime_get_ns() / 1000000ULL)
 
-#define DEBUG_LOG 1
-#if DEBUG_LOG
+
+
+#ifdef DEBUG_LOG
 #define BPF_LOG(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__);
 #else
 #define BPF_LOG(fmt, ...)
@@ -101,6 +145,38 @@ struct entropy_data{
 };
 
 
+struct write_event_hdr {
+    __u32 pid;
+    __u32 uid;
+    __u32 len;          
+    __u64 requested;    
+    char  fname[256];
+};
+
+struct write_event {
+    struct write_event_hdr hdr;
+    __u8  data[]; 
+};
+
+struct scratch_t {
+    struct write_event_hdr header;
+    __u8 data_buffer[AIRBAG_SIZE];
+};
+
+struct count_ctx {
+    struct freq_table *table;
+    __u8 *data_buffer;
+};
+
+struct copy_ctx {
+    struct scratch_t *scratch;
+    struct iov_iter *iter;
+    size_t current_seg_offset;
+    size_t total_requested;
+    __u32 bytes_copied;
+};
+
+#define GET_USER_UID() (__u32)bpf_get_current_uid_gid()
 
 struct user_stats_t {
     struct entropy_data entropy_data;
@@ -122,6 +198,7 @@ static void print_stats(struct user_stats_t *stats, __u32 uid)
     BPF_LOG("last access: %llu lock: %d", stats->last_access_ms, stats->stats_lock)
 }
 
+#if !STANDALONE
 static int is_nfsd(void) {
 
     char comm[COMM_SIZE];
@@ -132,6 +209,8 @@ static int is_nfsd(void) {
     
     return (*(unsigned int *)comm == NFSD_MAGIC);
 }
+#endif
+
 
 
 

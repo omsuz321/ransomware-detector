@@ -50,6 +50,7 @@ CompileFlags:
 EOF
 echo "      ✓ .clangd erstellt"
 
+
 # 3. Kernel-Source
 echo "[3/4] Prüfe Kernel-Source..."
 KERNEL_DIR="/work/linux-$KERNEL_VERSION"
