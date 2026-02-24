@@ -4,6 +4,7 @@ BPFTOOL ?= bpftool
 GCC     ?= gcc
 ENABLE_VFS_ITER_WRITE ?= 1
 ENABLE_ENTROPY ?= 1
+ENABLE_BPF_LOG ?= 0
 
 # Robust project root (egal von wo make aufgerufen wird)
 PROJECT_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
@@ -38,7 +39,8 @@ BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -D__BPF__ \
     -I$(LSM_INCLUDE_DIR) \
     -I$(SRC_DIR) \
     -I/usr/include \
-    -I/usr/include/bpf
+    -I/usr/include/bpf \
+    -DDEBUG_LOG=$(ENABLE_BPF_LOG)
 
 MONITOR_BPF_CFLAGS = $(BPF_CFLAGS) \
     -DENABLE_VFS_ITER_WRITE_HOOK=$(ENABLE_VFS_ITER_WRITE) \
@@ -102,6 +104,7 @@ bpf: link-headers vmlinux $(BPF_OBJ)
 
 $(BPF_OBJ): $(BPF_SRC)
 	@echo "[BPF] Compiling $(BPF_OBJ)..."
+	@echo "[BPF] ENABLE_BPF_LOG=$(ENABLE_BPF_LOG)"
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 # === Monitor ===
@@ -113,6 +116,7 @@ $(MONITOR_BPF_OBJ): $(MONITOR_BPF_SRC)
 	@echo "[MONITOR-BPF] Compiling $(MONITOR_BPF_OBJ)..."
 	@echo "[MONITOR-BPF] ENABLE_VFS_ITER_WRITE=$(ENABLE_VFS_ITER_WRITE)"
 	@echo "[MONITOR-BPF] ENABLE_ENTROPY=$(ENABLE_ENTROPY)"
+	@echo "[MONITOR-BPF] ENABLE_BPF_LOG=$(ENABLE_BPF_LOG)"
 	$(CLANG) $(MONITOR_BPF_CFLAGS) -c $< -o $@
 
 $(MONITOR_SKEL_H): $(MONITOR_BPF_OBJ)

@@ -13,6 +13,7 @@ cd "$PROJECT_DIR"
 # Variablen
 BPF_OBJ="vfs_write.bpf.o"
 PIN_DIR="/sys/fs/bpf/vfs_write_logger"
+ENABLE_BPF_LOG=0
 
 # Farben
 RED='\033[0;31m'
@@ -32,6 +33,21 @@ check_root() {
         log_error "Bitte als root ausführen: sudo $0 ..."
         exit 1
     fi
+}
+
+parse_bpf_log_flag() {
+    case "$1" in
+        --bpf-log)
+            ENABLE_BPF_LOG=1
+            ;;
+        --no-bpf-log)
+            ENABLE_BPF_LOG=0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 0
 }
 
 # ==========================================
@@ -78,9 +94,28 @@ do_clean() {
 
 do_build() {
     check_dependencies
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --bpf-log|--no-bpf-log)
+                parse_bpf_log_flag "$1"
+                shift
+                ;;
+            *)
+                log_error "Unbekannte Option: $1"
+                echo "Usage: $0 build [--bpf-log|--no-bpf-log]"
+                exit 1
+                ;;
+        esac
+    done
+
     echo -e "${BLUE}=== Baue eBPF Objekt ===${NC}"
+    if [ "$ENABLE_BPF_LOG" = "1" ]; then
+        log_info "bpf log (BPF_LOG): aktiviert"
+    else
+        log_info "bpf log (BPF_LOG): deaktiviert (default)"
+    fi
     make clean-bpf || true
-    make bpf
+    make bpf ENABLE_BPF_LOG="$ENABLE_BPF_LOG"
     
     if [ -f "$BPF_OBJ" ]; then
         log_success "Build erfolgreich."
@@ -136,6 +171,20 @@ do_load() {
     check_dependencies
     ensure_bpffs
 
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --bpf-log|--no-bpf-log)
+                parse_bpf_log_flag "$1"
+                shift
+                ;;
+            *)
+                log_error "Unbekannte Option: $1"
+                echo "Usage: sudo $0 load [--bpf-log|--no-bpf-log]"
+                exit 1
+                ;;
+        esac
+    done
+
     # IMMER neu bauen bei "load" (Korrektur integriert)
     echo -e "${BLUE}=== Erzwinge Neu-Bauen vor dem Laden ===${NC}"
     do_build
@@ -180,11 +229,34 @@ do_status() {
 # ==========================================
 # MAIN
 # ==========================================
+usage() {
+    cat << EOF
+Usage: sudo $0 {build|clean|load|unload|status|help} [opts]
+
+Commands:
+  build [opts]       Build eBPF object only
+  clean              Clean build files
+  load [opts]        Build + load eBPF object
+  unload             Unload eBPF programs/maps
+  status             Show status
+
+BPF log options (build/load):
+  --bpf-log          Aktiviere BPF_LOG -> bpf_printk
+  --no-bpf-log       Deaktiviere BPF_LOG (default)
+
+Examples:
+  sudo $0 build
+  sudo $0 build --bpf-log
+  sudo $0 load --bpf-log
+EOF
+}
+
 case "${1:-}" in
-    build)  do_build ;;
-    clean)  do_clean ;;  # NEU
-    load)   do_load ;;
+    build)  shift; do_build "$@" ;;
+    clean)  do_clean ;;
+    load)   shift; do_load "$@" ;;
     unload) do_unload ;;
     status) do_status ;;
-    help|*) echo "Usage: sudo $0 {build|clean|load|unload|status}"; exit 1 ;;
+    help)   usage ;;
+    *)      usage; exit 1 ;;
 esac

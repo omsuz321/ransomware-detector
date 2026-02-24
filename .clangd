@@ -1,6 +1,5 @@
 CompileFlags:
   Add:
-    - --compile-commands-dir=/work/security/my_lsm
     - -I/work/security/my_lsm/include
     - -I/work/include
     - -I/work/linux-6.14.0/include

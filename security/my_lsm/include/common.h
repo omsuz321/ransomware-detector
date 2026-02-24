@@ -87,10 +87,15 @@
 
 
 
-#ifdef DEBUG_LOG
-#define BPF_LOG(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__);
+/* DEBUG_LOG is controlled via build flag (default: off). */
+#ifndef DEBUG_LOG
+#define DEBUG_LOG 0
+#endif
+
+#if DEBUG_LOG
+#define BPF_LOG(fmt, ...) do { bpf_printk(fmt, ##__VA_ARGS__); } while (0);
 #else
-#define BPF_LOG(fmt, ...)
+#define BPF_LOG(fmt, ...) do { } while (0);
 #endif
 
 /**
@@ -216,4 +221,3 @@ static int is_nfsd(void) {
 
 
 #endif /* __COMMON_H */
-
