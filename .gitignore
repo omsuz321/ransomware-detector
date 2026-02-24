@@ -5,3 +5,5 @@ linux-6.14.0/
 *.zip
 *.dsc
 *.idx
+
+security/my_lsm/test_data/

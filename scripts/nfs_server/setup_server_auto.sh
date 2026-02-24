@@ -7,8 +7,9 @@
 # --- KONFIGURATION ---
 SHARE_DIR="/srv/nfs/thesis_data"
 TEST_MOUNT_DIR="/mnt/test_self"
-# Export-Optionen: Alle IPs (*), Lesen/Schreiben (rw), Sofort speichern (sync)
-EXPORT_OPTS="*(rw,sync,no_subtree_check)"
+# Export-Optionen laut Vorgabe:
+# /srv/nfs/thesis_data *(rw,sync,no_subtree_check,no_root_squash,insecure)
+EXPORT_OPTS="*(rw,sync,no_subtree_check,no_root_squash,insecure)"
 
 # --- FARBEN ---
 GREEN='\033[0;32m'
@@ -83,9 +84,18 @@ ENTRY="$SHARE_DIR $EXPORT_OPTS"
 # Backup erstellen
 cp "$EXPORT_FILE" "${EXPORT_FILE}.bak_$(date +%s)"
 
-# Wir prüfen mit grep, ob der Pfad schon in der Datei steht
-if grep -qF "$SHARE_DIR" "$EXPORT_FILE"; then
-    log_info "Eintrag existiert bereits in $EXPORT_FILE. Überspringe."
+# Eintrag für SHARE_DIR erzwingen:
+# - existiert noch nicht -> hinzufügen
+# - existiert mit anderen Optionen -> alle alten SHARE_DIR-Zeilen ersetzen
+if grep -Eq "^[[:space:]]*${SHARE_DIR//\//\\/}[[:space:]]" "$EXPORT_FILE"; then
+    if grep -Fxq "$ENTRY" "$EXPORT_FILE"; then
+        log_info "Exakter Eintrag existiert bereits in $EXPORT_FILE."
+    else
+        # Entfernt nur Zeilen für dieses Share-Verzeichnis, lässt alles andere unangetastet.
+        sed -i "\|^[[:space:]]*${SHARE_DIR}[[:space:]]|d" "$EXPORT_FILE"
+        echo "$ENTRY" >> "$EXPORT_FILE"
+        log_success "Eintrag aktualisiert: $ENTRY"
+    fi
 else
     echo "$ENTRY" >> "$EXPORT_FILE"
     log_success "Eintrag hinzugefügt: $ENTRY"

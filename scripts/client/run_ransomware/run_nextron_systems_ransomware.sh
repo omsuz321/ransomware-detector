@@ -25,6 +25,11 @@ for f in $(grep -rl "os.RemoveAll" .); do
 done
 
 # Sauberer Build
+if ! as_user bash -lc "command -v go >/dev/null 2>&1"; then
+    echo "❌ Go ist für Benutzer '$REAL_USER' nicht verfügbar."
+    echo "   Installieren mit: sudo apt install -y golang-go"
+    exit 1
+fi
 as_user go build -buildvcs=false -o ransomware-simulator ./cmd/...
 
 # --- 3. SIMULATION ---

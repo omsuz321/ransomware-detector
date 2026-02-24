@@ -6,11 +6,20 @@ DURATION=${2:-"10s"}
 CLEAN_DURATION=$(echo $DURATION | sed 's/[^0-9]//g')
 [ -z "$CLEAN_DURATION" ] || [ "$CLEAN_DURATION" -eq 0 ] && CLEAN_DURATION=10
 
-REAL_USER="cleint"
+REAL_USER=${SUDO_USER:-$(whoami)}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+as_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        sudo -u "$REAL_USER" "$@"
+    else
+        "$@"
+    fi
+}
 
 # Pfade
 REPO_URL="https://github.com/TomasPhilippart/ebpfangel.git"
-REPO_DIR="$(pwd)/ebpfangel"
+REPO_DIR="$SCRIPT_DIR/ebpfangel"
 SIM_DIR="$REPO_DIR/simulator"
 VENV_DIR="$REPO_DIR/venv"
 CURRENT_DIR="$(pwd)"
@@ -19,10 +28,10 @@ echo "--- START (ebpfangel mit Timeout-Check) ---"
 
 # --- 2. SETUP ---
 if [ ! -d "$REPO_DIR" ]; then
-    git clone "$REPO_URL" "$REPO_DIR" --quiet
+    as_user git clone "$REPO_URL" "$REPO_DIR" --quiet
 fi
 
-sudo chown -R $REAL_USER:$REAL_USER "$REPO_DIR"
+sudo chown -R "$REAL_USER":"$REAL_USER" "$REPO_DIR"
 cd "$SIM_DIR" || exit
 
 # SSL-Patch (verhindert Absturz bei neueren OpenSSL Versionen)
@@ -32,8 +41,36 @@ if ! grep -q "import ssl" simulator.py; then
 fi
 
 if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv "$VENV_DIR"
-    "$VENV_DIR/bin/python3" -m pip install -r requirements.txt --quiet
+    as_user python3 -m venv "$VENV_DIR"
+fi
+
+# Venv kann bereits existieren, aber unvollständig sein (z.B. fehlendes pip/pyAesCrypt).
+if ! as_user "$VENV_DIR/bin/python3" -m pip --version >/dev/null 2>&1; then
+    echo "   [*] pip fehlt im venv, versuche ensurepip ..."
+    as_user "$VENV_DIR/bin/python3" -m ensurepip --upgrade >/dev/null 2>&1 || true
+fi
+
+if ! as_user "$VENV_DIR/bin/python3" -m pip --version >/dev/null 2>&1; then
+    echo "   ❌ Konnte pip im venv nicht bereitstellen."
+    echo "      Venv: $VENV_DIR"
+    echo "      Bitte manuell prüfen: $VENV_DIR/bin/python3 -m ensurepip --upgrade"
+    exit 1
+fi
+
+if ! as_user "$VENV_DIR/bin/python3" -c "import pyAesCrypt" >/dev/null 2>&1; then
+    echo "   [*] Installiere fehlende Python-Abhängigkeiten (pyAesCrypt)..."
+    as_user "$VENV_DIR/bin/python3" -m pip install --upgrade pip >/dev/null 2>&1 || true
+    if ! as_user "$VENV_DIR/bin/python3" -m pip install -r requirements.txt pyAesCrypt --quiet; then
+        echo "   ❌ Installation der Python-Abhängigkeiten fehlgeschlagen."
+        echo "      Prüfe Netzwerk/Python-Setup und führe erneut aus."
+        exit 1
+    fi
+fi
+
+if ! as_user "$VENV_DIR/bin/python3" -c "import pyAesCrypt" >/dev/null 2>&1; then
+    echo "   ❌ pyAesCrypt ist weiterhin nicht importierbar."
+    echo "      Venv: $VENV_DIR"
+    exit 1
 fi
 
 # --- 3. START DER MESSUNG ---
@@ -57,24 +94,38 @@ while [ $(date +%s) -lt $END_TIME ]; do
     
     # Ausführung & Fehler-Capture
     # Wir senden SIGINT (-s 2), was in Python als KeyboardInterrupt erscheint.
-    SIM_ERR=$(sudo -u $REAL_USER timeout -k 3s -s SIGINT "${REMAINING}s" "$VENV_DIR/bin/python3" ./simulator.py \
+    SIM_ERR=$(as_user timeout -k 3s -s SIGINT "${REMAINING}s" "$VENV_DIR/bin/python3" ./simulator.py \
          --dir "$TARGET_DIR" \
-         --password "$PASSWORD" 2>&1 > /dev/null)
+         --password "$PASSWORD" 2>&1)
     EXIT_STATUS=$?
 
     # --- AUSWERTUNG ---
-    # 1. Prüfen, ob überhaupt Dateien erzeugt wurden
+    # ebpfangel meldet bei Erfolg oft selbst die Anzahl verschlüsselter Dateien.
     AES_COUNT=$(ls -1 "$TARGET_DIR"/*.aes 2>/dev/null | wc -l)
+    INPUT_COUNT=$(find "$TARGET_DIR" -type f ! -name '*.aes' 2>/dev/null | wc -l)
 
-    if [ $AES_COUNT -gt 0 ] && [ $EXIT_STATUS -eq 0 ]; then
-        echo "   ✅ ERFOLG: Alle Dateien wurden verschlüsselt ($AES_COUNT Dateien)."
+    if [ $EXIT_STATUS -eq 0 ]; then
+        if echo "$SIM_ERR" | grep -q "0 files encrypted"; then
+            echo "   ⚠️ KEIN WORKLOAD: Simulator lief, aber 0 Dateien verschlüsselt."
+            echo "      -> Eingabedateien im Zielpfad: $INPUT_COUNT"
+        elif [ $AES_COUNT -gt 0 ]; then
+            echo "   ✅ ERFOLG: Dateien wurden verschlüsselt ($AES_COUNT .aes Dateien)."
+        else
+            echo "   ⚠️ KEIN ERKENNBARER OUTPUT: Exit-Code 0, aber keine .aes-Dateien gefunden."
+            echo "      -> Eingabedateien im Zielpfad: $INPUT_COUNT"
+        fi
     elif [ $EXIT_STATUS -eq 124 ] || [ $EXIT_STATUS -eq 130 ]; then
         # 124 = Timeout / 130 = SIGINT (KeyboardInterrupt)
         echo "   🛑 ABBRUCH: Zeitlimit erreicht (Timeout)."
         echo "      -> Verschlüsselte Dateien bis zum Abbruch: $AES_COUNT"
     else
         echo "   ❌ ECHTER FEHLER: Der Simulator ist abgestürzt."
-        echo "      Grund: $SIM_ERR" | head -n 10
+        if [ -n "$SIM_ERR" ]; then
+            echo "      Grund (Exit-Code: $EXIT_STATUS):"
+            echo "$SIM_ERR" | sed 's/^/      /' | head -n 20
+        else
+            echo "      Grund: keine Fehlermeldung ausgegeben (Exit-Code: $EXIT_STATUS)"
+        fi
     fi
 
     sleep 1

@@ -11,12 +11,17 @@ CLEAN_DURATION=$(echo $DURATION | sed 's/[^0-9]//g')
 [ -z "$CLEAN_DURATION" ] || [ "$CLEAN_DURATION" -eq 0 ] && CLEAN_DURATION=10
 
 REAL_USER=${SUDO_USER:-$(whoami)}
-REPO_DIR="$(pwd)/Ransomware-Python"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$SCRIPT_DIR/Ransomware-Python"
 PY_FILE="$REPO_DIR/ransom.py"
 VENV_DIR="$REPO_DIR/venv"
 
 as_user() {
-    sudo -u "$REAL_USER" "$@"
+    if [ "$(id -u)" -eq 0 ]; then
+        sudo -u "$REAL_USER" "$@"
+    else
+        "$@"
+    fi
 }
 
 # --- 2. SETUP (ZÄHLT NOCH NICHT ZUR ZEIT) ---
@@ -30,8 +35,30 @@ chown -R "$REAL_USER":"$REAL_USER" "$REPO_DIR"
 as_user git -C "$REPO_DIR" checkout ransom.py --quiet
 
 if [ ! -d "$VENV_DIR" ]; then
-    as_user python3 -m venv "$VENV_DIR"
-    as_user "$VENV_DIR/bin/pip" install cryptography --quiet
+    if ! as_user python3 -m venv "$VENV_DIR"; then
+        echo "❌ Konnte kein Python-venv erstellen."
+        echo "   Bitte installieren: sudo apt install -y python3-venv python3-pip"
+        exit 1
+    fi
+fi
+
+if ! as_user "$VENV_DIR/bin/python3" -m pip --version >/dev/null 2>&1; then
+    as_user "$VENV_DIR/bin/python3" -m ensurepip --upgrade >/dev/null 2>&1 || true
+fi
+if ! as_user "$VENV_DIR/bin/python3" -m pip --version >/dev/null 2>&1; then
+    echo "❌ pip im venv nicht verfügbar: $VENV_DIR"
+    echo "   Bitte installieren: sudo apt install -y python3-venv python3-pip"
+    exit 1
+fi
+if ! as_user "$VENV_DIR/bin/python3" -c "import cryptography" >/dev/null 2>&1; then
+    if ! as_user "$VENV_DIR/bin/python3" -m pip install cryptography --quiet; then
+        echo "❌ Konnte Python-Paket 'cryptography' nicht installieren."
+        exit 1
+    fi
+fi
+if ! as_user "$VENV_DIR/bin/python3" -c "import cryptography" >/dev/null 2>&1; then
+    echo "❌ 'cryptography' bleibt nicht importierbar."
+    exit 1
 fi
 
 # --- 3. PATCHING (ZÄHLT NOCH NICHT ZUR ZEIT) ---

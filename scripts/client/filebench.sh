@@ -1,196 +1,200 @@
 #!/bin/bash
-# ==============================================================================
-# Filebench Controller (Thesis Edition - Final)
-# - Features: Custom Profiles (--profile), Custom Dirs (--dir), ASLR Auto-Restore
-# - Interaktives Cache-Dropping wird dynamisch ins Profil injiziert!
-# ==============================================================================
-
 set -euo pipefail
 
-# --- Konfiguration ---
-DEFAULT_NFS_MOUNT="/mnt/nfs"
-
-# Farben für Output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-# Variablen für die ursprünglichen Kernel-Zustände
-ORIG_ASLR=""
-ORIG_SHMMAX=""
-
-# --- System-Restore & Tempfile Cleanup ---
+# ==========================================
+# Parameter-Logik & Standards
+# ==========================================
+TEST_DIR="/mnt/nfs"
+RUNTIME="60"
+THREADS="1"
 TMP_FILES=()
+
 register_tmp() { TMP_FILES+=("$1"); }
-
-cleanup() {
-  for f in "${TMP_FILES[@]:-}"; do 
-    [ -n "${f:-}" ] && rm -f "$f" 2>/dev/null || true
-  done
-
-  if [[ -n "$ORIG_ASLR" ]]; then
-    echo -e "${YELLOW}⚙️ Stelle System-Sicherheit (ASLR) wieder her...${NC}"
-    echo "$ORIG_ASLR" | sudo tee /proc/sys/kernel/randomize_va_space > /dev/null
-  fi
-  if [[ -n "$ORIG_SHMMAX" ]]; then
-    echo "$ORIG_SHMMAX" | sudo tee /proc/sys/kernel/shmmax > /dev/null
-  fi
+cleanup_tmp_files() {
+    for f in "${TMP_FILES[@]:-}"; do
+        [[ -n "${f:-}" ]] && rm -f "$f" 2>/dev/null || true
+    done
 }
-trap cleanup EXIT TERM INT
+trap cleanup_tmp_files EXIT TERM INT
 
-# --- Kernel-Fixes anwenden ---
-apply_kernel_fixes() {
-  if [[ -z "$ORIG_ASLR" ]]; then
-    ORIG_ASLR=$(cat /proc/sys/kernel/randomize_va_space 2>/dev/null || echo 2)
-  fi
-  if [[ -z "$ORIG_SHMMAX" ]]; then
-    ORIG_SHMMAX=$(cat /proc/sys/kernel/shmmax 2>/dev/null || echo 33554432)
-  fi
+build_fb_script_from_profile() {
+    local mode="$1"          # prepare|run
+    local profile_file="$2"
+    local target_dir="$3"
+    local runtime="$4"
+    local out="$5"
+    local profile_body
 
-  echo -e "${YELLOW}⚙️ Deaktiviere ASLR temporär für Filebench...${NC}"
-  echo 0 | sudo tee /proc/sys/kernel/randomize_va_space > /dev/null
-  echo 2147483648 | sudo tee /proc/sys/kernel/shmmax > /dev/null
-}
+    profile_body="$(
+        sed -E \
+            -e '/^[[:space:]]*set[[:space:]]+\$dir[[:space:]]*=.*/Id' \
+            -e '/^[[:space:]]*set[[:space:]]+\$nthreads[[:space:]]*=.*/Id' \
+            -e '/^[[:space:]]*set[[:space:]]+\$threads[[:space:]]*=.*/Id' \
+            -e '/^[[:space:]]*run([[:space:]]|$).*/Id' \
+            "$profile_file"
+    )"
 
-# --- Hilfe ---
-print_help() {
-  cat << EOF
-Usage: sudo ./$(basename "$0") <setup|prepare|run|teardown> [OPTIONS]
+    if [[ "$mode" == "prepare" ]]; then
+        # In prepare sollen Dateien wirklich angelegt werden.
+        profile_body="$(
+            printf '%s\n' "$profile_body" | sed -E '/^[[:space:]]*define[[:space:]]+fileset[[:space:]]/{
+                s/prealloc[[:space:]]*=[[:space:]]*[^,[:space:]]+/prealloc=100/
+                t
+                s/$/,prealloc=100/
+            }'
+        )"
+    fi
 
-Beispiel:
-  sudo ./$(basename "$0") prepare --dir /mnt/nfs --profile ./fileserver.f
-  sudo ./$(basename "$0") run --time 900 --dir /mnt/nfs --profile ./fileserver.f
-EOF
-}
-
-# --- 1. SETUP ---
-cmd_setup() {
-  local server_ip="${1:-localhost}"
-  echo -e "${BLUE}=== Setup: Mount NFS ===${NC}"
-  sudo mkdir -p "$DEFAULT_NFS_MOUNT"
-  if ! mountpoint -q "$DEFAULT_NFS_MOUNT"; then
-    sudo mount -t nfs -o vers=3,nolock "$server_ip:/srv/nfs/thesis_data" "$DEFAULT_NFS_MOUNT" || { 
-        echo -e "${RED}Mount fehlgeschlagen! IP prüfen.${NC}"; exit 1; 
-    }
-  fi
-  echo -e "${GREEN}✅ NFS gemountet auf $DEFAULT_NFS_MOUNT${NC}"
+    {
+        echo "set \$dir=$target_dir"
+        echo "set \$nthreads=$THREADS"
+        echo "set \$threads=$THREADS"
+        printf '%s\n' "$profile_body"
+        if [[ "$mode" == "prepare" ]]; then
+            echo "create files"
+        else
+            echo "run $runtime"
+        fi
+    } > "$out"
 }
 
-# --- 2. PREPARE ---
-cmd_prepare() {
-  echo -e "${BLUE}=== Prepare: Erstelle Testdateien ===${NC}"
-  
-  local profile=""
-  local dir_override="$DEFAULT_NFS_MOUNT"
-  local EXTRA_ARGS=()
-
-  # Argumente parsen
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -p|--profile) profile="$2"; shift 2 ;;
-      --dir) dir_override="$2"; shift 2 ;;
-      -v) EXTRA_ARGS+=("-v" "$2"); shift 2 ;;
-      *) echo -e "${RED}❌ Unbekanntes Argument: $1${NC}"; exit 1 ;;
-    esac
-  done
-
-  [ -z "$profile" ] && { echo -e "${RED}❌ Bitte --profile angeben!${NC}"; exit 1; }
-  [ ! -f "$profile" ] && { echo -e "${RED}❌ Profildatei '$profile' nicht gefunden!${NC}"; exit 1; }
-
-  local prep_tmp=$(mktemp /tmp/fb_prep.XXXXXX.f)
-  register_tmp "$prep_tmp"
-
-  cp "$profile" "$prep_tmp"
-
-  # Pfad im Profil anpassen
-  sed -i "s|^set[[:space:]]*\$dir=.*|set \$dir=$dir_override|g" "$prep_tmp"
-  
-  # Den 'run' Befehl entfernen (wir wollen ja nur vorbereiten)
-  sed -i '/^[[:space:]]*run[[:space:]]/d' "$prep_tmp"
-  
-  # Stattdessen 'create files' ans Ende setzen
-  echo "create files" >> "$prep_tmp"
-
-  apply_kernel_fixes
-
-  filebench -f "$prep_tmp" "${EXTRA_ARGS[@]}"
-  echo -e "${GREEN}✅ Vorbereitung abgeschlossen.${NC}"
+show_help() {
+    echo "Usage: sudo $0 <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  install                  Installiert Filebench mit Fixes"
+    echo "  prepare <file> <dir>     Erstellt NUR die Dateien für ein Profil"
+    echo "  run <file> <dir> [sec]   Startet Benchmark (nutzt vorhandene Daten)"
+    echo "  uninstall                Entfernt Filebench restlos"
+    echo ""
+    echo "Beispiele:"
+    echo "  sudo $0 prepare tests/my.f /mnt/nfs    <- Erstellt Daten auf NFS"
+    echo "  sudo $0 run tests/my.f /mnt/nfs 30     <- Startet Test für 30s"
 }
 
-# --- 3. RUN ---
-cmd_run() {
-  local duration="60"
-  local profile=""
-  local dir_override="$DEFAULT_NFS_MOUNT"
-  local EXTRA_ARGS=()
+if [[ $# -lt 1 ]]; then
+    show_help
+    exit 1
+fi
 
-  # Argumente parsen
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -t|--time) duration="$2"; shift 2 ;;
-      -p|--profile) profile="$2"; shift 2 ;;
-      --dir) dir_override="$2"; shift 2 ;;
-      -v) EXTRA_ARGS+=("-v" "$2"); shift 2 ;;
-      *) echo -e "${RED}❌ Unbekanntes Argument: $1${NC}"; exit 1 ;;
-    esac
-  done
+COMMAND="$1"
+shift || true
 
-  [ -z "$profile" ] && { echo -e "${RED}❌ Bitte --profile angeben!${NC}"; exit 1; }
-  [ ! -f "$profile" ] && { echo -e "${RED}❌ Profildatei '$profile' nicht gefunden!${NC}"; exit 1; }
+# ==========================================
+# COMMAND: INSTALL
+# ==========================================
+if [[ "$COMMAND" == "install" ]]; then
+    echo "=== Installiere Filebench mit Buffer-Overflow Fix ==="
+    sudo apt-get update
+    sudo apt-get install -y git build-essential flex bison automake autoconf libtool pkg-config
 
-  local run_tmp=$(mktemp /tmp/fb_run.XXXXXX.f)
-  register_tmp "$run_tmp"
+    if [ ! -d "filebench-src" ]; then
+        git clone --depth 1 https://github.com/filebench/filebench.git filebench-src
+    fi
+    
+    cd filebench-src
+    echo "[+] Konfiguriere mit CFLAGS Fix..."
+    libtoolize && aclocal && autoheader && automake --add-missing && autoconf
+    ./configure CFLAGS="-O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+    make -j"$(nproc)"
+    sudo make install
+    sudo ldconfig
+    cd ..
+    echo "=== Installation erfolgreich! ==="
+    exit 0
+fi
 
-  cp "$profile" "$run_tmp"
+# ==========================================
+# COMMAND: UNINSTALL
+# ==========================================
+if [[ "$COMMAND" == "uninstall" ]]; then
+    echo "=== Entferne Filebench vom System ==="
+    if [ -d "filebench-src" ]; then
+        (cd filebench-src && sudo make uninstall 2>/dev/null || true)
+        rm -rf filebench-src
+    fi
+    sudo apt-get remove --purge -y filebench 2>/dev/null || true
+    sudo rm -f /usr/local/bin/filebench /usr/bin/filebench
+    echo "=== Deinstallation abgeschlossen! ==="
+    exit 0
+fi
 
-  # Pfad im Profil anpassen
-  sed -i "s|^set[[:space:]]*\$dir=.*|set \$dir=$dir_override|g" "$run_tmp"
+# ==========================================
+# COMMAND: PREPARE (Daten erstellen)
+# ==========================================
+if [[ "$COMMAND" == "prepare" ]]; then
+    PROFILE_FILE="${1:-}"
+    TARGET_DIR="${2:-$TEST_DIR}"
 
-  # Sicherstellen, dass "reuse" beim Fileset steht (damit er nicht neu anlegt)
-  if ! grep -q "reuse" "$run_tmp"; then
-    sed -i '/^[[:space:]]*define fileset/ s/$/,reuse/' "$run_tmp"
-  fi
+    if ! command -v filebench &> /dev/null; then
+        echo "Fehler: Filebench ist nicht installiert."
+        exit 1
+    fi
 
-  # Den alten 'run' Befehl entfernen
-  sed -i '/^[[:space:]]*run[[:space:]]/d' "$run_tmp"
+    if [[ ! -f "$PROFILE_FILE" ]]; then
+        echo "Fehler: Profil-Datei '$PROFILE_FILE' nicht gefunden!"
+        exit 1
+    fi
 
-  # Das Interaktive Menü und den Cache-Drop DYNAMISCH unten anhängen!
-  {
-    echo "echo \"🔍 Scanne Metadaten (Pre-allocation)...\""
-    echo "create files"
-    echo "echo \"------------------------------------------------------------\""
-    echo "echo \"✅ Metadaten-Scan fertig (Dentries/Inodes sind im RAM).\""
-    echo "echo \"🚀 Drücke ENTER um Caches zu leeren und Messung zu starten!\""
-    echo "echo \"------------------------------------------------------------\""
-    echo "system \"read dummy < /dev/tty\""
-    echo "echo \"🧹 Dropping Caches (Client)...\""
-    echo "system \"sync\""
-    echo "system \"echo 3 > /proc/sys/vm/drop_caches\""
-    echo "sleep 2"
-    echo "echo \"🏁 Starte Benchmark-Lauf...\""
-    echo "run $duration"
-  } >> "$run_tmp"
+    echo "=== PREPARE: Erstelle Daten ==="
+    echo "[+] Profil: $PROFILE_FILE"
+    echo "[+] Ziel:   $TARGET_DIR"
+    mkdir -p "$TARGET_DIR" 2>/dev/null || sudo mkdir -p "$TARGET_DIR"
 
-  apply_kernel_fixes
+    # ASLR Workaround
+    ORIG_ASLR=$(cat /proc/sys/kernel/randomize_va_space)
+    sudo sh -c "echo 0 > /proc/sys/kernel/randomize_va_space"
 
-  echo -e "${BLUE}=== Starte Filebench ===${NC}"
-  filebench -f "$run_tmp" "${EXTRA_ARGS[@]}"
-}
+    # Wir erzeugen ein temporäres WML-Script und führen es non-interaktiv aus.
+    PREP_SCRIPT="$(mktemp /tmp/filebench_prepare.XXXXXX.f)"
+    register_tmp "$PREP_SCRIPT"
+    build_fb_script_from_profile "prepare" "$PROFILE_FILE" "$TARGET_DIR" "$RUNTIME" "$PREP_SCRIPT"
+    filebench -f "$PREP_SCRIPT"
 
-# --- 4. TEARDOWN ---
-cmd_teardown() {
-  echo -e "${YELLOW}=== Teardown: Unmount NFS ===${NC}"
-  sudo umount -l "$DEFAULT_NFS_MOUNT" 2>/dev/null || true
-  echo -e "${GREEN}✅ Abgeschlossen.${NC}"
-}
+    CREATED_FILES=$(find "$TARGET_DIR" -type f 2>/dev/null | wc -l || true)
+    echo "[+] Dateien (rekursiv): $CREATED_FILES"
 
-# --- Main Switch ---
-case "${1:-}" in
-  setup)    shift; cmd_setup "$@" ;;
-  prepare)  shift; cmd_prepare "$@" ;;
-  run)      shift; cmd_run "$@" ;;
-  teardown) cmd_teardown ;;
-  *)        print_help ;;
-esac
+    sudo sh -c "echo $ORIG_ASLR > /proc/sys/kernel/randomize_va_space"
+    echo "=== Vorbereitung abgeschlossen! ==="
+    exit 0
+fi
+
+# ==========================================
+# COMMAND: RUN (Benchmark ausführen)
+# ==========================================
+if [[ "$COMMAND" == "run" ]]; then
+    PROFILE_FILE="${1:-}"
+    TARGET_DIR="${2:-$TEST_DIR}"
+    RUNTIME="${3:-$RUNTIME}"
+
+    if [[ ! -f "$PROFILE_FILE" ]]; then
+        echo "Fehler: Profil-Datei '$PROFILE_FILE' nicht gefunden!"
+        exit 1
+    fi
+
+    if ! command -v filebench &> /dev/null; then
+        echo "Fehler: Filebench ist nicht installiert."
+        exit 1
+    fi
+
+    echo "=== RUN: Starte Benchmark (Reuse aktiv) ==="
+    echo "[+] Profil: $PROFILE_FILE"
+    echo "[+] Ziel:   $TARGET_DIR"
+    echo "[+] Dauer:  $RUNTIME Sek."
+
+    # ASLR Workaround
+    ORIG_ASLR=$(cat /proc/sys/kernel/randomize_va_space)
+    sudo sh -c "echo 0 > /proc/sys/kernel/randomize_va_space"
+
+    # Wir erzeugen ein temporäres WML-Script und führen es non-interaktiv aus.
+    # WICHTIG: Im Profil sollte beim fileset 'reuse' stehen, wenn vorhandene Dateien genutzt werden sollen.
+    RUN_SCRIPT="$(mktemp /tmp/filebench_run.XXXXXX.f)"
+    register_tmp "$RUN_SCRIPT"
+    build_fb_script_from_profile "run" "$PROFILE_FILE" "$TARGET_DIR" "$RUNTIME" "$RUN_SCRIPT"
+    filebench -f "$RUN_SCRIPT"
+
+    sudo sh -c "echo $ORIG_ASLR > /proc/sys/kernel/randomize_va_space"
+    exit 0
+fi
+
+show_help
