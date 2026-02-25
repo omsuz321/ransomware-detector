@@ -59,8 +59,11 @@ MONITOR_FLAGS="$MONITOR_ENTROPY_FLAG $MONITOR_BPF_LOG_FLAG"
 
 # Verzeichnisse auf dem Server
 SERVER_BASE_DIR="/srv/nfs/thesis_data"
-SERVER_WORK_DIR="$SERVER_BASE_DIR/tmp"
-SERVER_BACKUP_DIR="/srv/nfs/clean_backup"
+SERVER_SOURCE_DIR="$SERVER_BASE_DIR/$(basename "$CLIENT_MOUNT")"
+# Der Workdir ist bewusst ein Unterordner der Quelle:
+#   SOURCE -> SOURCE/tmp
+# So ist der Zielpfad für die Simulatoren über NFS konsistent.
+SERVER_WORK_DIR="$SERVER_SOURCE_DIR/tmp"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIX_SCRIPT="$SCRIPT_DIR/open_access_for_client.sh"
@@ -70,6 +73,8 @@ CURRENT_MONITOR_CSV=""
 CURRENT_MONITOR_MODE=""
 LAST_SERVER_FILE_COUNT=0
 SKIP_NEXTRON=0
+SERVER_TMP_MARKER=""
+RESOLVED_CLIENT_TMP_PATH=""
 
 # --- 2. ARGUMENT-CHECK ---
 if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PASS" ] || [ -z "$DURATION" ]; then
@@ -124,22 +129,85 @@ check_local_runtime_prereqs() {
 # --- 3. SERVER-VORBEREITUNG ---
 restore_data_on_server() {
     echo -e "\n   [♻️] Bereite Server-Workdir vor ($SERVER_IP)..."
+    SERVER_TMP_MARKER=".run_test_tmp_marker_$(date +%s)_$RANDOM"
+    echo "   [📁] Restore-Quelle: $SERVER_SOURCE_DIR -> $SERVER_WORK_DIR"
 
-    sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" "
-        if [ ! -d '$SERVER_WORK_DIR' ]; then
-            echo '$SERVER_PASS' | sudo -S mkdir -p '$SERVER_WORK_DIR'
-        else
-            echo '$SERVER_PASS' | sudo -S rm -rf '$SERVER_WORK_DIR'/*
-        fi
-        if [ -d '$SERVER_BACKUP_DIR' ] && [ \"\$(ls -A '$SERVER_BACKUP_DIR' 2>/dev/null)\" ]; then
-            echo '$SERVER_PASS' | sudo -S cp -r '$SERVER_BACKUP_DIR'/. '$SERVER_WORK_DIR'/
-        else
-            echo 'WARN: Backup-Quelle fehlt oder ist leer: $SERVER_BACKUP_DIR (überspringe Restore-Kopie)'
-        fi
-    "
+    if ! sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" 'bash -s' -- \
+        "$SERVER_PASS" \
+        "$SERVER_SOURCE_DIR" \
+        "$SERVER_WORK_DIR" \
+        "$SERVER_BASE_DIR" \
+        "$SERVER_TMP_MARKER" <<'EOF'
+set -euo pipefail
+SERVER_PASS="$1"
+SOURCE_DIR="$2"
+WORK_DIR="$3"
+BASE_DIR="$4"
+MARKER="$5"
+
+if [ ! -d "$SOURCE_DIR" ]; then
+    echo "ERROR: Quellordner fehlt: $SOURCE_DIR" >&2
+    exit 1
+fi
+
+if [ "$SOURCE_DIR" = "$WORK_DIR" ]; then
+    echo "ERROR: Quelle und Ziel (tmp) dürfen nicht identisch sein: $SOURCE_DIR" >&2
+    exit 1
+fi
+
+printf '%s\n' "$SERVER_PASS" | sudo -S -p '' mkdir -p "$BASE_DIR" "$WORK_DIR"
+
+# Robustes Leeren: mehrere Versuche gegen temporäre NFS-Race-Zustände.
+for i in 1 2 3; do
+    printf '%s\n' "$SERVER_PASS" | sudo -S -p '' bash -c '
+set -e
+WORK_DIR="$1"
+mkdir -p "$WORK_DIR"
+find "$WORK_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+' _ "$WORK_DIR" && break
+    sleep 1
+done
+
+if [ -n "$(printf '%s\n' "$SERVER_PASS" | sudo -S -p '' ls -A "$WORK_DIR" 2>/dev/null || true)" ]; then
+    echo "ERROR: Konnte tmp nicht vollständig leeren: $WORK_DIR" >&2
+    exit 1
+fi
+
+# Kopiere Quelle nach tmp.
+# Falls WORK_DIR innerhalb SOURCE_DIR liegt, kopieren wir nur Top-Level-Einträge
+# und schließen den tmp-Ordner aus, um Rekursion (tmp -> tmp/tmp/...) zu vermeiden.
+if [[ "$WORK_DIR" == "$SOURCE_DIR/"* ]]; then
+    WORK_BASENAME="$(basename "$WORK_DIR")"
+    printf '%s\n' "$SERVER_PASS" | sudo -S -p '' bash -c '
+set -e
+SOURCE_DIR="$1"
+WORK_DIR="$2"
+WORK_BASENAME="$3"
+find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 ! -name "$WORK_BASENAME" -exec cp -a -t "$WORK_DIR" -- {} +
+' _ "$SOURCE_DIR" "$WORK_DIR" "$WORK_BASENAME"
+else
+    printf '%s\n' "$SERVER_PASS" | sudo -S -p '' cp -a "$SOURCE_DIR"/. "$WORK_DIR"/
+fi
+
+# Warteprüfung: enthält tmp nach dem Kopieren Nutzdaten?
+if [ -z "$(printf '%s\n' "$SERVER_PASS" | sudo -S -p '' ls -A "$WORK_DIR" 2>/dev/null || true)" ]; then
+    echo "ERROR: tmp ist nach dem Kopieren leer: $WORK_DIR" >&2
+    exit 1
+fi
+
+printf '%s\n' "$SERVER_PASS" | sudo -S -p '' touch "$WORK_DIR/$MARKER"
+printf '%s\n' "$SERVER_PASS" | sudo -S -p '' sync
+EOF
+    then
+        echo "   [❌] Restore auf Server fehlgeschlagen (Quelle -> tmp)."
+        return 1
+    fi
 
     # Rechte-Fix auf dem Server ausführen
-    sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" 'bash -s' -- "$SERVER_WORK_DIR" "$SERVER_PASS" < "$FIX_SCRIPT"
+    if ! sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" 'bash -s' -- "$SERVER_WORK_DIR" "$SERVER_PASS" < "$FIX_SCRIPT"; then
+        echo "   [❌] Rechte-Fix auf Server fehlgeschlagen."
+        return 1
+    fi
 
     # Sichtbarkeit: Wieviel Workload liegt nach Restore wirklich im Workdir?
     local file_count
@@ -156,6 +224,26 @@ restore_data_on_server() {
 
     # Client-Cache leeren
     sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+    return 0
+}
+
+clear_server_tmp_dir() {
+    sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" 'bash -s' -- \
+        "$SERVER_PASS" \
+        "$SERVER_WORK_DIR" <<'EOF'
+set -euo pipefail
+SERVER_PASS="$1"
+WORK_DIR="$2"
+printf '%s\n' "$SERVER_PASS" | sudo -S -p '' mkdir -p "$WORK_DIR"
+for i in 1 2 3; do
+    printf '%s\n' "$SERVER_PASS" | sudo -S -p '' bash -c '
+set -e
+WORK_DIR="$1"
+find "$WORK_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+' _ "$WORK_DIR" && break
+    sleep 1
+done
+EOF
 }
 
 as_root() {
@@ -177,18 +265,35 @@ count_files_local() {
 
 ensure_client_nfs_visibility() {
     local with_tmp="$CLIENT_MOUNT/tmp"
-    local direct="$CLIENT_MOUNT"
+    local nested_tmp="$CLIENT_MOUNT/$(basename "$SERVER_SOURCE_DIR")/tmp"
+    local sibling_tmp
+    sibling_tmp="$(dirname "$CLIENT_MOUNT")/tmp"
+    local candidate_paths=("$with_tmp" "$nested_tmp" "$sibling_tmp")
+    local marker_found_at=""
     local cnt_tmp
-    local cnt_direct
+    local cnt_nested
+    local cnt_sibling
+    local needs_remount=0
 
     cnt_tmp="$(count_files_local "$with_tmp")"
-    cnt_direct="$(count_files_local "$direct")"
-    echo "   [📡] Client-Sicht: $direct=$cnt_direct Dateien, $with_tmp=$cnt_tmp Dateien"
+    cnt_nested="$(count_files_local "$nested_tmp")"
+    cnt_sibling="$(count_files_local "$sibling_tmp")"
+    echo "   [📡] Client-Sicht: $with_tmp=$cnt_tmp, $nested_tmp=$cnt_nested, $sibling_tmp=$cnt_sibling"
 
-    # Nur reagieren, wenn Server klar Daten hat, Client aber nichts sieht.
-    if [ "${LAST_SERVER_FILE_COUNT:-0}" -gt 0 ] && [ "$cnt_tmp" -eq 0 ] && [ "$cnt_direct" -eq 0 ]; then
-        echo "   [⚠️] Server hat ${LAST_SERVER_FILE_COUNT} Dateien, Client sieht 0. Versuche NFS-Remount ..."
+    for p in "${candidate_paths[@]}"; do
+        if [ -f "$p/$SERVER_TMP_MARKER" ]; then
+            marker_found_at="$p"
+            break
+        fi
+    done
 
+    # Strikt: wir arbeiten nur mit .../tmp.
+    if [ -z "$marker_found_at" ]; then
+        needs_remount=1
+        echo "   [⚠️] tmp-Marker auf Client nicht sichtbar. Versuche NFS-Remount ..."
+    fi
+
+    if [ "$needs_remount" -eq 1 ]; then
         if mountpoint -q "$CLIENT_MOUNT"; then
             as_root umount "$CLIENT_MOUNT" >/dev/null 2>&1 || as_root umount -l "$CLIENT_MOUNT" >/dev/null 2>&1 || true
         fi
@@ -197,15 +302,27 @@ ensure_client_nfs_visibility() {
         sleep 1
 
         cnt_tmp="$(count_files_local "$with_tmp")"
-        cnt_direct="$(count_files_local "$direct")"
-        echo "   [📡] Nach Remount: $direct=$cnt_direct Dateien, $with_tmp=$cnt_tmp Dateien"
+        cnt_nested="$(count_files_local "$nested_tmp")"
+        cnt_sibling="$(count_files_local "$sibling_tmp")"
+        echo "   [📡] Nach Remount: $with_tmp=$cnt_tmp, $nested_tmp=$cnt_nested, $sibling_tmp=$cnt_sibling"
 
-        if [ "$cnt_tmp" -eq 0 ] && [ "$cnt_direct" -eq 0 ]; then
-            echo "   [❌] NFS auf Client weiterhin leer, obwohl Server Daten hat."
-            echo "      Prüfe Client-Mount manuell: mount | grep nfs"
-            return 1
-        fi
+        for p in "${candidate_paths[@]}"; do
+            if [ -f "$p/$SERVER_TMP_MARKER" ]; then
+                marker_found_at="$p"
+                break
+            fi
+        done
     fi
+
+    if [ -z "$marker_found_at" ]; then
+        echo "   [❌] Konnte den tmp-Marker auf dem Client nicht finden."
+        echo "      Erwartet in einem der Pfade: $with_tmp | $nested_tmp | $sibling_tmp"
+        echo "      Prüfe Client-Mount manuell: mount | grep nfs"
+        return 1
+    fi
+
+    RESOLVED_CLIENT_TMP_PATH="$marker_found_at"
+    echo "   [✅] Erkannter tmp-Zielpfad auf Client: $RESOLVED_CLIENT_TMP_PATH"
 
     return 0
 }
@@ -241,35 +358,10 @@ EOF
 }
 
 resolve_client_target_path() {
-    local with_tmp="$CLIENT_MOUNT/tmp"
-    local direct="$CLIENT_MOUNT"
-    local cnt_tmp=""
-    local cnt_direct=""
-
-    if [ -d "$with_tmp" ]; then
-        cnt_tmp="$(find "$with_tmp" -type f 2>/dev/null | wc -l | tr -d '[:space:]')"
-    fi
-    if [ -d "$direct" ]; then
-        cnt_direct="$(find "$direct" -type f 2>/dev/null | wc -l | tr -d '[:space:]')"
-    fi
-
-    # Bevorzugt /tmp, wenn dort echte Workload liegt.
-    if [[ "$cnt_tmp" =~ ^[0-9]+$ ]] && [ "$cnt_tmp" -gt 0 ]; then
-        echo "$with_tmp"
-        return 0
-    fi
-
-    # Fallback: einige Setups mounten den Workdir direkt auf CLIENT_MOUNT.
-    if [[ "$cnt_direct" =~ ^[0-9]+$ ]] && [ "$cnt_direct" -gt 0 ]; then
-        echo "   [ℹ️] Nutze Client-Zielpfad ohne /tmp (Dateien: $cnt_direct)." >&2
-        echo "$direct"
-        return 0
-    fi
-
-    if [ -d "$with_tmp" ]; then
-        echo "$with_tmp"
+    if [ -n "$RESOLVED_CLIENT_TMP_PATH" ]; then
+        echo "$RESOLVED_CLIENT_TMP_PATH"
     else
-        echo "$direct"
+        echo "$CLIENT_MOUNT/tmp"
     fi
 }
 
@@ -526,6 +618,7 @@ cleanup_on_exit() {
     if [ "$ENABLE_REMOTE_MONITOR" = "1" ]; then
         stop_monitor_on_server || true
     fi
+    clear_server_tmp_dir || true
 }
 
 trap cleanup_on_exit EXIT INT TERM
@@ -545,7 +638,10 @@ for sim in "${SIMS[@]}"; do
             continue
         fi
 
-        restore_data_on_server
+        if ! restore_data_on_server; then
+            echo "   [❌] Restore fehlgeschlagen. Überspringe $sim."
+            continue
+        fi
         enforce_server_access_for_all
         if ! ensure_client_nfs_visibility; then
             echo "   [❌] NFS-Sichtprüfung fehlgeschlagen. Überspringe $sim."
@@ -571,6 +667,7 @@ for sim in "${SIMS[@]}"; do
         if [ "$ENABLE_REMOTE_MONITOR" = "1" ]; then
             stop_monitor_on_server
         fi
+        clear_server_tmp_dir || true
         sleep 5
     fi
 done
