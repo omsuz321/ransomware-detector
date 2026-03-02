@@ -10,7 +10,7 @@
 #include "../include/io_helpers.h"
 #include "../include/entropy.h"
 #include "../include/read_write_ratio.h"
-#include "../include/leaky_bucket.h"
+
 
 
 
@@ -62,17 +62,17 @@ struct {
 // it can only be one of them. therefore i can use jus t one lock for both the thread level and the last access time, because only the thread that updaets the thread level would also update the last access time, thus ensuring that we have a consistent view of the thread level and the last access time, because if another thread has updated the thread level, then we know that it has also updated the last access time, thus we can use the last access time to determine whether we should do the decision logic or not
 static void CountEvent(int mask, struct user_stats_t *stats, __u32 uid)
 {
-    BPF_LOG("mask: %d", mask);
+    //BPF_LOG("mask: %d", mask);
     if (mask == MAY_WRITE)
     {
-        BPF_LOG("enter write");
-        __sync_fetch_and_add(&stats->write_count, 1);
+        //BPF_LOG("enter write");
+        __sync_fetch_and_add(&stats->io_stats.write_count, 1);
         return;
     }
     else if (mask == MAY_READ)
     {
-        BPF_LOG("enter read");
-        __sync_fetch_and_add(&stats->read_count, 1);
+        //BPF_LOG("enter read");
+        __sync_fetch_and_add(&stats->io_stats.read_count, 1);
     }
 }
 
@@ -139,12 +139,24 @@ static struct user_stats_t *GetOrCreateUserStats(__u32 uid)
 //    return stats->used_bucket_capacity > BUCKET_CAPACITY ? 1 : 0;
 //}
 
-static int malicious_read_write_ratio(__s32 total_written, __s32 total_read)
+static int malicious_read_write_ratio(struct io_stats *io_stats)
 {
-    struct fixed_point s_index = symmetry_index(total_written, total_read);
-    BPF_LOG("Symmetry index for UID %u: %d/%02d", GET_USER_UID(), total_read, total_written)
+    struct fixed_point s_index = symmetry_index(io_stats->write_count, io_stats->read_count);
+    BPF_LOG("Symmetry index for UID %u: r=%d w=%d", GET_USER_UID(), io_stats->read_count, io_stats->write_count);
     print_fixed_point("X.XX", &s_index);
-    return A_IS_LESS_OR_EQUAL_B(&s_index, &__symmetriy_index_tollerance) ? 1 : 0;
+    
+    io_stats->write_count = 0;
+    io_stats->read_count = 0;
+    if(!A_IS_LESS_OR_EQUAL_B(&s_index, &__symmetriy_index_tollerance))
+    {
+        io_stats->k_streak = 0;
+        BPF_LOG("change k %d", io_stats->k_streak);
+        return 0;
+    }
+    io_stats->k_streak++;
+        BPF_LOG("change k %d", io_stats->k_streak);
+
+    return io_stats->k_streak >= INVESTIGATION_STREAK_K ? 1 : 0;
 }
 
 
@@ -152,8 +164,16 @@ static int malicious_read_write_ratio(__s32 total_written, __s32 total_read)
 static  __s8 has_malicious_entropy_score(struct entropy_data *entropy_data)
 {   
     struct fixed_point avg_entropy = get_avg_entropy(entropy_data);
-    __s8 ret = A_IS_GREATER_OR_EQUAL_B(&avg_entropy, &__entropy_threshold) == 1 ? 1 : -1;
-    return ret;
+    
+    entropy_data->entropy_sum = (struct fixed_point){0};
+    entropy_data->count = 0;
+    if(!A_IS_GREATER_OR_EQUAL_B(&avg_entropy, &__entropy_threshold))
+    {
+        entropy_data->k_streak = 0;
+        return -1;
+    }
+    entropy_data->k_streak++;
+    return entropy_data->k_streak >= VERDICT_STREAK_K ? 1 : 0;
 }
 
 static void reset_user_stats(struct user_stats_t *stats, __s32 prev_thread)
@@ -166,13 +186,13 @@ static void reset_user_stats(struct user_stats_t *stats, __s32 prev_thread)
        //     break;
     
         case STAGE_INVESTIGATION:
-            stats->read_count = 0;
-            stats->write_count = 0;
+            stats->io_stats = (struct io_stats){0};
             break;
             
         case STAGE_VERDICT:
             stats->entropy_data.entropy_sum = (struct fixed_point){0};
             stats->entropy_data.count = 0;
+            stats->entropy_data.k_streak = 0;
             break;
         default:
             break;
@@ -191,7 +211,7 @@ static int thread_level_decision(struct user_stats_t *stats)
         //    break;
     
         case STAGE_INVESTIGATION:
-            stats->thread_level += malicious_read_write_ratio(stats->write_count, stats->read_count);
+            stats->thread_level += malicious_read_write_ratio(&stats->io_stats);
             break;
             
         case STAGE_VERDICT:
@@ -204,12 +224,12 @@ static int thread_level_decision(struct user_stats_t *stats)
     if(prev_thread_level != stats->thread_level)
     {
         reset_user_stats(stats, prev_thread_level);
-        BPF_LOG("Thread level changed from %d to %d for UID %u", prev_thread_level, stats->thread_level, GET_USER_UID())
+        BPF_LOG("Thread level changed from %d to %d for UID %u", prev_thread_level, stats->thread_level, GET_USER_UID());
     }
 
     block_decision = stats->thread_level >= BLOCK_ACTION;
     if (block_decision)
-        BPF_LOG("block decision: tl=%d, uid=%u", stats->thread_level, GET_USER_UID())
+        BPF_LOG("block decision: tl=%d, uid=%u", stats->thread_level, GET_USER_UID());
 
     return block_decision;
 }
@@ -267,7 +287,7 @@ static int try_run_or_skip_detection(struct user_stats_t *stats, int stage_name)
 
     if(trigger_detector(stats))
     {
-        BPF_LOG("Trigger Detector stage=%d tl=%u", stage_name, stats->thread_level)
+        BPF_LOG("Trigger Detector stage=%d tl=%u", stage_name, stats->thread_level);
         process(stats);
         return 1;
     }
@@ -281,21 +301,21 @@ int BPF_PROG(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
     if (!is_nfsd()) 
     return 0;
 
-    BPF_LOG("enter write")
+    //BPF_LOG("enter write");
     struct user_stats_t *stats;
     __u32 uid = GET_USER_UID();
 
     stats = GetOrCreateUserStats(uid);
     if (!stats)
     {
-        BPF_LOG("Failed to get or create user stats for UID %u", uid)
+        BPF_LOG("Failed to get or create user stats for UID %u", uid);
         return 0;
     }
     if(try_run_or_skip_detection(stats, STAGE_VERDICT))
         return 0;
 
     process_entropy(file, iter, &stats->entropy_data);
-    BPF_LOG("entropy")
+    //BPF_LOG("entropy");
     return 0; 
 }
 
@@ -309,13 +329,13 @@ int BPF_PROG(log_file_permission, struct file *file, int mask)
     stats = GetOrCreateUserStats(uid);
     if (!stats)
     {
-        BPF_LOG("Failed to get or create user stats for UID %u", uid)
+        BPF_LOG("Failed to get or create user stats for UID %u", uid);
         return 0;
 
     }
-
     if(stats->thread_level == BLOCK_ACTION)
         return -EACCES;
+    
     if(try_run_or_skip_detection(stats, STAGE_INVESTIGATION))
     {
         //BPF_LOG("Early return from file_permission for UID %u due to investigation stage", uid)
@@ -325,7 +345,7 @@ int BPF_PROG(log_file_permission, struct file *file, int mask)
     // Just count the event in file_permission handler
     // Decision happens in vfs_iter_write_enter with proper locking
     CountEvent(mask, stats, uid);
-    print_stats(stats, GET_USER_UID());
+    //print_stats(stats, GET_USER_UID());
     return 0;
 }
 
@@ -336,13 +356,13 @@ int BPF_PROG(lsm_file_open, struct file *file)
     if (!is_nfsd())  // oder dein lokales VFS-Filter
       return 0;
     
-    BPF_LOG("OPEN")
+    //BPF_LOG("OPEN");
     struct user_stats_t *stats;
     __u32 uid = GET_USER_UID();
     stats = GetOrCreateUserStats(uid);
     if (!stats)
     {
-        BPF_LOG("Failed to get or create user stats for UID %u", uid)
+        BPF_LOG("Failed to get or create user stats for UID %u", uid);
         return 0;
 
     }

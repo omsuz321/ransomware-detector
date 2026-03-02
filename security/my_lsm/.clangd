@@ -6,7 +6,8 @@ CompileFlags:
     - -D__BPF__
     - -g
     - -O2
-  IncludeDir:
-    - /work/include
-    - include
-    - src
+    - -I/work/include
+    - -Iinclude
+    - -Isrc
+    - -I/usr/include
+    - -I/usr/include/bpf

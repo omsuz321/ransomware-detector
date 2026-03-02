@@ -31,7 +31,7 @@
 
 #define COMM_SIZE 16
 // ungefähr entpsicht 0.302260
-#define RW_SYMMERTY_TOLLERANCE ((struct fixed_point ) { .number = 15, .q = 1 })
+#define RW_SYMMERTY_TOLLERANCE ((struct fixed_point ) { .number = 316942, .q = 20 })
 #define ENTROPY_THRESHOLD ((struct fixed_point ) { .number = 15, .q = 1 })// 7.5 in decinal, equelas 111.1 in binary, this means afteer the shit we have 1111.0, ,wthile the number before is 8 and bumber of shifts is 1
 
 #define EPERM   1  /* Operation not permitted (Fehlende Rechte/Root) */
@@ -72,8 +72,17 @@
 #define BLOCK_ACTION 3
 
 //#define SCREENING_INTERVAL_MS 1000ULL
-#define INVESTIGATION_INTERVAL_MS 1000ULL
-#define VERDICT_INTERVAL_MS 1000ULL
+#define INVESTIGATION_INTERVAL_MS 2500ULL
+#define VERDICT_INTERVAL_MS 2500ULL
+
+// Consecutive hit thresholds per stage
+#ifndef INVESTIGATION_STREAK_K
+#define INVESTIGATION_STREAK_K 2
+#endif
+
+#ifndef VERDICT_STREAK_K
+#define VERDICT_STREAK_K 3
+#endif
 
 
 
@@ -93,9 +102,11 @@
 #endif
 
 #if DEBUG_LOG
-#define BPF_LOG(fmt, ...) do { bpf_printk(fmt, ##__VA_ARGS__); } while (0);
+#define BPF_LOG(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
+#define PRINT_FIXED_POINT(prefix, fp) print_fixed_point(prefix, fp)
 #else
-#define BPF_LOG(fmt, ...) do { } while (0);
+#define BPF_LOG(fmt, ...) ((void)0)
+#define PRINT_FIXED_POINT(prefix, fp) ((void)0)
 #endif
 
 /**
@@ -146,6 +157,7 @@ struct entropy_ctx {
 struct entropy_data{
     struct fixed_point entropy_sum;
     __u32 count;
+    __u8 k_streak;
     struct bpf_spin_lock lock;
 };
 
@@ -183,13 +195,18 @@ struct copy_ctx {
 
 #define GET_USER_UID() (__u32)bpf_get_current_uid_gid()
 
+struct io_stats {
+    __s32 read_count;
+    __s32 write_count;
+    __s32 open_count;
+    __u8  k_streak;
+};
+
 struct user_stats_t {
     struct entropy_data entropy_data;
     __u64 last_access_ms;
     volatile lock_type stats_lock;  // Protects thread_level and last_access_ms
-    __s32 read_count;
-    __s32 write_count;
-    __s32 open_count;
+    struct io_stats io_stats;
     __s32 used_bucket_capacity;
     __s8 thread_level;
 };
@@ -197,10 +214,10 @@ struct user_stats_t {
 static void print_stats(struct user_stats_t *stats, __u32 uid)
 {
     BPF_LOG("UID %u | open count: %d, bucket: %d, tl: %d", 
-            uid, stats->open_count, stats->used_bucket_capacity, stats->thread_level)
+        uid, stats->io_stats.open_count, stats->used_bucket_capacity, stats->thread_level);
     BPF_LOG("UID %u | read count: %d, write count: %d", 
-            uid, stats->read_count, stats->write_count)
-    BPF_LOG("last access: %llu lock: %d", stats->last_access_ms, stats->stats_lock)
+        uid, stats->io_stats.read_count, stats->io_stats.write_count);
+    BPF_LOG("last access: %llu lock: %d", stats->last_access_ms, stats->stats_lock);
 }
 
 #if !STANDALONE

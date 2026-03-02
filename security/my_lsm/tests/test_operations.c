@@ -110,8 +110,13 @@ int main(void)
     calculate_entropy(&table, 0, &entropy,1);
     assert_fixed("Empty Input (Len 0)", entropy, "0.000 bits");
 
-    struct fixed_point threshold =  { .number = 15, .q = 1 };
-    assert_fixed("trying number representaiton: 7.5", threshold, "7.500 bits");
+    struct fixed_point entropy_threshold =  { .number = 15, .q = 1 };
+    assert_fixed("trying number representaiton: 7.5", entropy_threshold, "7.500 bits");
     printf("\nTests abgeschlossen.\n");
+    // ungefähr entpsicht 0.302260
+    struct fixed_point symmetriy_threashold = { .number = 316842, .q = 20 };
+    assert_fixed("trying number representaiton: 0.302260", symmetriy_threashold, "0.302260 bits");
+    printf("\nTests abgeschlossen.\n");
+
     return 0;
 }

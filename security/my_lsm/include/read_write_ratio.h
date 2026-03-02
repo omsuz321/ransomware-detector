@@ -47,8 +47,9 @@ static __always_inline struct fixed_point symmetry_index(__s32 total_written, __
     // abs value of (total_written - total_read) / (total_written + total_read)
     __s32 __dividend = total_written > total_read ? total_written - total_read : total_read - total_written;
     __s32 __divisor = total_read + total_written;
-    struct fixed_point dividend = to_fixed_point(__dividend, 0);
-    struct fixed_point divisor = to_fixed_point(__divisor, 0);
+    // Use headroom in Q to preserve fractions in division result
+    struct fixed_point dividend = to_fixed_point(__dividend, 17);
+    struct fixed_point divisor  = to_fixed_point(__divisor, 17);
     return divide(&dividend, &divisor);
 }
 

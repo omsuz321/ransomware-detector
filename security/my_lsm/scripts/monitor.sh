@@ -17,6 +17,7 @@ PIN_DIR="/sys/fs/bpf/fileops_logger"
 ENABLE_VFS_ITER_WRITE=1
 ENABLE_ENTROPY=1
 ENABLE_BPF_LOG=0
+MONITOR_BG_PID_FILE="/tmp/fileops_logger.pid"
 
 # Colors
 RED='\033[0;31m'
@@ -211,6 +212,7 @@ do_unload() {
             log_success "Kernel ist sauber."
         fi
     fi
+    rm -f "$MONITOR_BG_PID_FILE" 2>/dev/null || true
     return 0
 }
 
@@ -375,6 +377,152 @@ do_run() {
     log_success "Fertig. CSV liegt unter: $output"
 }
 
+do_run_bg() {
+    check_root
+    check_dependencies
+
+    local output="/var/log/nfs_fileops.csv"
+    local ring_mb=256
+    local output_set=0
+    local stdout_log="/tmp/fileops_logger.bg.log"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -o|--output)
+                if [[ $# -lt 2 ]]; then
+                    log_error "Fehlender Wert für $1"
+                    echo "Usage: sudo $0 run-bg [-o FILE|FILE] [--stdout FILE] [--ring-mb N] [--vfs-iter-write|--no-vfs-iter-write] [--entropy|--no-entropy] [--bpf-log|--no-bpf-log]"
+                    exit 1
+                fi
+                output="$2"
+                output_set=1
+                shift 2
+                ;;
+            --stdout)
+                if [[ $# -lt 2 ]]; then
+                    log_error "Fehlender Wert für --stdout"
+                    echo "Usage: sudo $0 run-bg [-o FILE|FILE] [--stdout FILE] [--ring-mb N] [--vfs-iter-write|--no-vfs-iter-write] [--entropy|--no-entropy] [--bpf-log|--no-bpf-log]"
+                    exit 1
+                fi
+                stdout_log="$2"
+                shift 2
+                ;;
+            --ring-mb)
+                if [[ $# -lt 2 ]]; then
+                    log_error "Fehlender Wert für --ring-mb"
+                    echo "Usage: sudo $0 run-bg [-o FILE|FILE] [--stdout FILE] [--ring-mb N] [--vfs-iter-write|--no-vfs-iter-write] [--entropy|--no-entropy] [--bpf-log|--no-bpf-log]"
+                    exit 1
+                fi
+                ring_mb="$2"
+                shift 2
+                ;;
+            --vfs-iter-write|--no-vfs-iter-write)
+                parse_vfs_iter_write_flag "$1"
+                shift
+                ;;
+            --entropy|--no-entropy)
+                parse_entropy_flag "$1"
+                shift
+                ;;
+            --bpf-log|--no-bpf-log)
+                parse_bpf_log_flag "$1"
+                shift
+                ;;
+            --)
+                shift
+                while [[ $# -gt 0 ]]; do
+                    if [ "$output_set" = "0" ]; then
+                        output="$1"
+                        output_set=1
+                        shift
+                    else
+                        log_error "Zu viele Positionsargumente: $1"
+                        echo "Usage: sudo $0 run-bg [-o FILE|FILE] [--stdout FILE] [--ring-mb N] [--vfs-iter-write|--no-vfs-iter-write] [--entropy|--no-entropy] [--bpf-log|--no-bpf-log]"
+                        exit 1
+                    fi
+                done
+                ;;
+            -*)
+                log_error "Unbekannte Option: $1"
+                echo "Usage: sudo $0 run-bg [-o FILE|FILE] [--stdout FILE] [--ring-mb N] [--vfs-iter-write|--no-vfs-iter-write] [--entropy|--no-entropy] [--bpf-log|--no-bpf-log]"
+                exit 1
+                ;;
+            *)
+                if [ "$output_set" = "0" ]; then
+                    output="$1"
+                    output_set=1
+                    shift
+                else
+                    log_error "Zu viele Positionsargumente: $1"
+                    echo "Usage: sudo $0 run-bg [-o FILE|FILE] [--stdout FILE] [--ring-mb N] [--vfs-iter-write|--no-vfs-iter-write] [--entropy|--no-entropy] [--bpf-log|--no-bpf-log]"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    do_build
+
+    log_info "Setze alten Zustand zurück..."
+    do_unload || true
+
+    if [ ! -f "$MONITOR_LOG_BIN" ]; then
+        log_error "Logger binary nicht gefunden: $MONITOR_LOG_BIN"
+        exit 1
+    fi
+
+    local log_dir
+    log_dir=$(dirname "$output")
+    [ -d "$log_dir" ] || mkdir -p "$log_dir"
+
+    local stdout_dir
+    stdout_dir=$(dirname "$stdout_log")
+    [ -d "$stdout_dir" ] || mkdir -p "$stdout_dir"
+
+    echo -e "${BLUE}=== Starte Logger im Hintergrund ===${NC}"
+    log_info "CSV: $output"
+    log_info "Stdout/Stderr: $stdout_log"
+
+    local logger_args=("-o" "$output")
+    [ "$ring_mb" != "256" ] && logger_args+=("--ring-mb" "$ring_mb")
+
+    nohup "$MONITOR_LOG_BIN" "${logger_args[@]}" >"$stdout_log" 2>&1 &
+    local logger_pid=$!
+    echo "$logger_pid" > "$MONITOR_BG_PID_FILE"
+
+    sleep 1
+    if ! kill -0 "$logger_pid" >/dev/null 2>&1; then
+        log_error "Logger ist direkt wieder beendet. Siehe $stdout_log"
+        rm -f "$MONITOR_BG_PID_FILE" 2>/dev/null || true
+        exit 1
+    fi
+
+    log_success "Logger läuft im Hintergrund (PID: $logger_pid)"
+    log_info "Stoppen mit: sudo $0 teardown"
+}
+
+do_teardown() {
+    check_root
+    echo -e "${BLUE}=== Teardown (Logger + BPF) ===${NC}"
+
+    if [ -f "$MONITOR_BG_PID_FILE" ]; then
+        local pid
+        pid="$(cat "$MONITOR_BG_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+            log_info "Stoppe Hintergrund-Logger PID $pid ..."
+            kill -INT "$pid" >/dev/null 2>&1 || true
+            sleep 1
+            if kill -0 "$pid" >/dev/null 2>&1; then
+                kill -TERM "$pid" >/dev/null 2>&1 || true
+            fi
+        fi
+        rm -f "$MONITOR_BG_PID_FILE" 2>/dev/null || true
+    fi
+
+    do_unload || true
+    log_success "Teardown abgeschlossen."
+}
+
 # ==========================================
 # 5. STATUS
 # ==========================================
@@ -398,7 +546,7 @@ do_status() {
 # ==========================================
 usage() {
     cat << EOF
-Usage: sudo $0 {build|clean|load|unload|run|status|help} [opts]
+Usage: sudo $0 {build|clean|load|unload|run|run-bg|teardown|status|help} [opts]
 
 Commands:
   build [opts]       Build BPF + Userspace binaries only
@@ -406,28 +554,33 @@ Commands:
   load [opts]        Load BPF programmes into kernel
   unload             Unload BPF programmes from kernel
   run [opts]         Build + Start logger (logger loads/attaches BPF)
+  run-bg [opts]      Build + Start logger im Hintergrund
+  teardown           Stoppt Hintergrund-Logger und entlädt BPF
   status             Show current monitor status
 
 Run options:
   -o FILE            Output CSV file (default: /var/log/nfs_fileops.csv)
   FILE               Optionales Positionsargument für Output-Pfad
   --ring-mb N        Ringbuffer size in MiB (default: 256)
+  --stdout FILE      Nur bei run-bg: Datei für logger stdout/stderr
 
-Hook options (build/load/run):
+Hook options (build/load/run/run-bg):
   --vfs-iter-write       Aktiviere fentry/vfs_iter_write Hook (default)
   --no-vfs-iter-write    Deaktiviere fentry/vfs_iter_write Hook
 
-Entropy options (build/load/run):
+Entropy options (build/load/run/run-bg):
   --entropy              Aktiviere Entropy-Berechnung (default)
   --no-entropy           Deaktiviere Entropy-Berechnung
 
-BPF log options (build/load/run):
+BPF log options (build/load/run/run-bg):
   --bpf-log              Aktiviere BPF_LOG -> bpf_printk
   --no-bpf-log           Deaktiviere BPF_LOG (default)
 
 Examples:
   sudo $0 clean
   sudo $0 run
+  sudo $0 run-bg --no-entropy --no-bpf-log -o /tmp/fileops.csv --stdout /tmp/monitor.log
+  sudo $0 teardown
   sudo $0 run --bpf-log
   sudo $0 run --no-vfs-iter-write
   sudo $0 run --no-entropy
@@ -445,6 +598,8 @@ case "${1:-}" in
     load)   shift; do_load "$@" ;;
     unload) do_unload ;;
     run)    shift; do_run "$@" ;;
+    run-bg) shift; do_run_bg "$@" ;;
+    teardown) do_teardown ;;
     status) do_status ;;
     help)   usage ;;
     *)      usage; exit 1 ;;

@@ -6,7 +6,7 @@
 
 # --- KONFIGURATION ---
 REMOTE_EXPORT_DIR="/srv/nfs/thesis_data"
-LOCAL_MOUNT_POINT="/mnt/thesis_data_client"
+LOCAL_MOUNT_POINT="/mnt/nfs"
 
 # --- FARBEN ---
 GREEN='\033[0;32m'
