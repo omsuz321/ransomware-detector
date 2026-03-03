@@ -81,6 +81,15 @@ counter=1
 echo "=================================================="
 echo " 🚀 ebpfangel Simulator (Detail-Check)"
 echo "=================================================="
+echo "[DEBUG] Target-Verzeichnis: $TARGET_DIR"
+echo "[DEBUG] Existiert: $([ -d "$TARGET_DIR" ] && echo "JA" || echo "NEIN")"
+if [ -d "$TARGET_DIR" ]; then
+    echo "[DEBUG] Anzahl Dateien: $(find "$TARGET_DIR" -type f 2>/dev/null | wc -l)"
+    echo "[DEBUG] Anzahl Ordner: $(find "$TARGET_DIR" -type d 2>/dev/null | wc -l)"
+    echo "[DEBUG] Erste 5 Einträge:"
+    ls -lh "$TARGET_DIR" 2>/dev/null | head -6 | sed 's/^/  /'
+fi
+echo ""
 
 while [ $(date +%s) -lt $END_TIME ]; do
     REMAINING=$(( END_TIME - $(date +%s) ))

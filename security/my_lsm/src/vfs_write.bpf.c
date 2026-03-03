@@ -10,6 +10,7 @@
 #include "../include/io_helpers.h"
 #include "../include/entropy.h"
 #include "../include/read_write_ratio.h"
+#include "../include/ransomware_event.h"
 
 
 
@@ -57,6 +58,34 @@ struct {
     __type(key, __u32);
     __type(value, struct user_stats_t);
 } user_tracker SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 8 * 1024 * 1024);
+} events SEC(".maps");
+
+static __always_inline void submit_ransomware_event(
+    __u8 event_type,
+    __u32 uid,
+    __u64 user_created_ms,
+    __u8 ransomware_detected,
+    struct file *file)
+{
+    struct ransomware_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt)
+        return;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    evt->ts_ns = bpf_ktime_get_ns();
+    evt->uid = uid;
+    evt->user_created_ms = user_created_ms;
+    evt->event_type = event_type;
+    evt->ransomware_detected = ransomware_detected;
+    if (file)
+        evt->inode = BPF_CORE_READ(file, f_inode, i_ino);
+
+    bpf_ringbuf_submit(evt, 0);
+}
 
 
 // it can only be one of them. therefore i can use jus t one lock for both the thread level and the last access time, because only the thread that updaets the thread level would also update the last access time, thus ensuring that we have a consistent view of the thread level and the last access time, because if another thread has updated the thread level, then we know that it has also updated the last access time, thus we can use the last access time to determine whether we should do the decision logic or not
@@ -123,11 +152,13 @@ static struct user_stats_t *GetOrCreateUserStats(__u32 uid)
     //BPF_LOG("Creating new user stats for UID %u", uid)
     struct user_stats_t init_stats = {0};
     init_stats.last_access_ms = BPF_KTIME_GET_MS();
+    init_stats.created_ms = init_stats.last_access_ms;
     init_stats.thread_level = STAGE_INVESTIGATION;
     
     
     //BPF_LOG("Enter: GetOrCreateUserStats for UID %u", uid)
     bpf_map_update_elem(&user_tracker, &uid, &init_stats, BPF_NOEXIST);
+    submit_ransomware_event(RANSOMWARE_EVT_USER_CREATED, uid, init_stats.created_ms, 0, 0);
     return bpf_map_lookup_elem(&user_tracker, &uid);
 }
 
@@ -199,7 +230,7 @@ static void reset_user_stats(struct user_stats_t *stats, __s32 prev_thread)
     }
 }
 
-static int thread_level_decision(struct user_stats_t *stats)
+static int thread_level_decision(struct user_stats_t *stats, __u32 uid, struct file *file)
 {
     // cast is premissibale because we only have 3 stages, so the thread_level will never exceed the range of __s8
     int block_decision;
@@ -224,12 +255,14 @@ static int thread_level_decision(struct user_stats_t *stats)
     if(prev_thread_level != stats->thread_level)
     {
         reset_user_stats(stats, prev_thread_level);
-        BPF_LOG("Thread level changed from %d to %d for UID %u", prev_thread_level, stats->thread_level, GET_USER_UID());
+        BPF_LOG("Thread level changed from %d to %d for UID %u", prev_thread_level, stats->thread_level, uid);
     }
 
     block_decision = stats->thread_level >= BLOCK_ACTION;
-    if (block_decision)
-        BPF_LOG("block decision: tl=%d, uid=%u", stats->thread_level, GET_USER_UID());
+    if (block_decision) {
+        submit_ransomware_event(RANSOMWARE_EVT_DETECTED, uid, stats->created_ms, 1, file);
+        BPF_LOG("block decision: tl=%d, uid=%u", stats->thread_level, uid);
+    }
 
     return block_decision;
 }
@@ -264,11 +297,11 @@ static int process_entropy(struct file *file, struct iov_iter *iter, struct entr
 
 // this allows to do the detection logic for only one thread, the other ones that are also dealing wiht the same client, will skip it for now
 
-static int process(struct user_stats_t *stats)
+static int process(struct user_stats_t *stats, __u32 uid, struct file *file)
 {
     if(TRY_LOCK_USER_T_OR_SKIP(stats))
     {
-        thread_level_decision(stats);
+        thread_level_decision(stats, uid, file);
         stats->last_access_ms = BPF_KTIME_GET_MS();
         UNLOCK_USER_T(stats);
     }
@@ -277,7 +310,7 @@ static int process(struct user_stats_t *stats)
 
 
 //TODO: remove the early return after testing
-static int try_run_or_skip_detection(struct user_stats_t *stats, int stage_name)
+static int try_run_or_skip_detection(struct user_stats_t *stats, int stage_name, __u32 uid, struct file *file)
 {
     // Only collect entropy in VERDICT stage or Skip if decision is already in progress
     if(SHOULD_SKIP_STAGE_OR_WORK(stage_name, stats))
@@ -288,7 +321,7 @@ static int try_run_or_skip_detection(struct user_stats_t *stats, int stage_name)
     if(trigger_detector(stats))
     {
         BPF_LOG("Trigger Detector stage=%d tl=%u", stage_name, stats->thread_level);
-        process(stats);
+        process(stats, uid, file);
         return 1;
     }
     return  0;
@@ -311,7 +344,7 @@ int BPF_PROG(vfs_iter_write_enter, struct file *file, struct iov_iter *iter)
         BPF_LOG("Failed to get or create user stats for UID %u", uid);
         return 0;
     }
-    if(try_run_or_skip_detection(stats, STAGE_VERDICT))
+    if(try_run_or_skip_detection(stats, STAGE_VERDICT, uid, file))
         return 0;
 
     process_entropy(file, iter, &stats->entropy_data);
@@ -336,7 +369,7 @@ int BPF_PROG(log_file_permission, struct file *file, int mask)
     if(stats->thread_level == BLOCK_ACTION)
         return -EACCES;
     
-    if(try_run_or_skip_detection(stats, STAGE_INVESTIGATION))
+    if(try_run_or_skip_detection(stats, STAGE_INVESTIGATION, uid, file))
     {
         //BPF_LOG("Early return from file_permission for UID %u due to investigation stage", uid)
         return 0;

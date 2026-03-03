@@ -205,6 +205,7 @@ struct io_stats {
 struct user_stats_t {
     struct entropy_data entropy_data;
     __u64 last_access_ms;
+    __u64 created_ms;
     volatile lock_type stats_lock;  // Protects thread_level and last_access_ms
     struct io_stats io_stats;
     __s32 used_bucket_capacity;

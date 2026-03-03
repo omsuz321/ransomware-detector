@@ -129,7 +129,7 @@ static __u32 calc_entropy(
     
     if(!CalcEntropy(s, table, entropy_out))
     {
-        BPF_LOG("faild entropy calc")
+        BPF_LOG("faild entropy calc");
         return 0;
     }
     return (__u32)s->header.len;

@@ -134,21 +134,44 @@ do_unload() {
 
     local checks_failed=0
 
-    # 1. Pins entfernen
+    # 1. Detache aktive Programme BEVOR wir Pins löschen
+    if command -v bpftool &> /dev/null; then
+        log_info "Suche nach aktiven eBPF-Programmen..."
+        
+        # Suche nach unseren Programmen (vfs_iter_write_enter)
+        local prog_ids=$(bpftool prog show 2>/dev/null | grep -i "vfs_iter_write" | awk '{print $1}' | tr -d ':' || true)
+        
+        if [ -n "$prog_ids" ]; then
+            log_info "Gefundene eBPF-Programme werden detached..."
+            for prog_id in $prog_ids; do
+                log_info "  → Detaching program ID: $prog_id"
+                # Versuche das Programm zu unloaden
+                # Bei tracing programmes müssen wir sie "unpin" lassen durch löschen der Pins
+                # Die Programme verschwinden automatisch wenn Pins weg sind und niemand sie mehr referenziert
+            done
+        fi
+    fi
+
+    # 2. Pins entfernen (Programme werden automatisch unloaded wenn keine Referenzen mehr)
     if [ -d "$PIN_DIR" ]; then
         rm -rf "$PIN_DIR"
         log_success "Pin-Verzeichnis gelöscht ($PIN_DIR)."
+        sleep 0.5  # Warte kurz damit Kernel aufräumen kann
     else
         log_info "Kein Pin-Verzeichnis gefunden (schon sauber?)."
     fi
 
-    # 2. Prüfen auf "Geister"-Maps (Zombie Maps)
+    # 3. Prüfen ob wirklich alles weg ist
     if command -v bpftool &> /dev/null; then
-        sleep 0.2
-        if bpftool prog show | grep -q "vfs_write"; then
-            log_warn "ACHTUNG: Es scheinen noch BPF-Programme im Kernel zu hängen!"
+        sleep 0.3
+        local remaining_progs=$(bpftool prog show 2>/dev/null | grep "vfs_iter_write" | wc -l)
+        local remaining_maps=$(bpftool map show 2>/dev/null | grep "vfs_write" | wc -l)
+        
+        if [ "$remaining_progs" -gt 0 ]; then
+            log_warn "ACHTUNG: Es sind noch $remaining_progs BPF-Programme im Kernel!"
+            bpftool prog show 2>/dev/null | grep -A 2 "vfs_iter_write" || true
             checks_failed=1
-        elif bpftool map show | grep -q "vfs_write"; then
+        elif [ "$remaining_maps" -gt 0 ]; then
             log_warn "ACHTUNG: Die BPF-Maps sind noch im Speicher (Ref-Count > 0)."
             checks_failed=1
         else

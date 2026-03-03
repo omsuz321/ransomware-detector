@@ -1,0 +1,17 @@
+# Starten - NUR noch Label und Run-ID nötig
+sudo scripts/ransomware_monitor.sh run-bg \
+  -o /tmp/test.csv \
+  --run-id "run_001" \
+  --label "wannacry_test"
+
+# Stoppen → Eine Zeile wird geschrieben
+sudo scripts/ransomware_monitor.sh stop
+
+
+
+./run_all_evaluations.sh 192.168.2.209 /mnt/nfs/traget 30 "1234" /home/server/Desktop/dev/scripts
+
+
+/srv/nfs/thesis_data *(rw,sync,no_subtree_check,no_root_squash,all_squash,anonuid=65534,anongid=65534,insecure)
+sudo exportfs -ra
+sudo systemctl restart nfs-kernel-server

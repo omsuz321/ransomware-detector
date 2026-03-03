@@ -55,6 +55,7 @@ USERSPACE_LIBS   = -lbpf -lelf -lz
 # VFS Write (altes System) - Wieder auf $(SRC_DIR) gesetzt
 BPF_SRC  := $(SRC_DIR)/vfs_write.bpf.c
 BPF_OBJ  := $(PROJECT_ROOT)/vfs_write.bpf.o
+VFS_SKEL_H := $(INCLUDE_DIR)/vfs_write.skel.h
 
 # Fileops Monitor (neues System)
 MONITOR_BPF_SRC := $(MONITOR_DIR)/fileops_lsm.bpf.c
@@ -62,8 +63,10 @@ MONITOR_BPF_OBJ := $(MONITOR_DIR)/fileops_lsm.bpf.o
 MONITOR_SKEL_H  := $(MONITOR_DIR)/fileops_lsm.skel.h
 MONITOR_LOG_SRC := $(MONITOR_DIR)/fileops_logger.c
 MONITOR_LOG_BIN := $(MONITOR_DIR)/fileops_logger
+RANSOMWARE_LOG_SRC := $(MONITOR_DIR)/ransomware_logger.c
+RANSOMWARE_LOG_BIN := $(MONITOR_DIR)/ransomware_logger
 
-.PHONY: all bpf monitor monitor-bpf monitor-userspace vmlinux link-headers clean clean-bpf clean-monitor
+.PHONY: all bpf monitor monitor-bpf monitor-userspace ransomware-userspace vmlinux link-headers clean clean-bpf clean-monitor
 
 all: bpf monitor
 
@@ -100,12 +103,16 @@ link-headers:
 	fi
 
 # === BPF (alt) ===
-bpf: link-headers vmlinux $(BPF_OBJ)
+bpf: link-headers vmlinux $(BPF_OBJ) $(VFS_SKEL_H)
 
 $(BPF_OBJ): $(BPF_SRC)
 	@echo "[BPF] Compiling $(BPF_OBJ)..."
 	@echo "[BPF] ENABLE_BPF_LOG=$(ENABLE_BPF_LOG)"
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+$(VFS_SKEL_H): $(BPF_OBJ)
+	@echo "[BPF-SKEL] Generating $(VFS_SKEL_H)..."
+	$(BPFTOOL) gen skeleton $< > $@
 
 # === Monitor ===
 monitor: monitor-bpf monitor-userspace
@@ -125,17 +132,24 @@ $(MONITOR_SKEL_H): $(MONITOR_BPF_OBJ)
 
 monitor-userspace: $(MONITOR_LOG_BIN)
 
+ransomware-userspace: bpf $(RANSOMWARE_LOG_BIN)
+
 $(MONITOR_LOG_BIN): $(MONITOR_LOG_SRC) $(MONITOR_SKEL_H)
 	@echo "[MONITOR-USERSPACE] Compiling logger..."
 	$(GCC) $(USERSPACE_CFLAGS) -I$(INCLUDE_DIR) \
 	    $(MONITOR_LOG_SRC) -o $@ $(USERSPACE_LIBS)
+
+$(RANSOMWARE_LOG_BIN): $(RANSOMWARE_LOG_SRC) $(VFS_SKEL_H)
+	@echo "[RANSOMWARE-USERSPACE] Compiling ransomware logger..."
+	$(GCC) $(USERSPACE_CFLAGS) -I$(INCLUDE_DIR) \
+	    $(RANSOMWARE_LOG_SRC) -o $@ $(USERSPACE_LIBS)
 
 # === Cleanup ===
 clean-bpf:
 	rm -f $(BPF_OBJ)
 
 clean-monitor:
-	rm -f $(MONITOR_BPF_OBJ) $(MONITOR_SKEL_H) $(MONITOR_LOG_BIN)
+	rm -f $(MONITOR_BPF_OBJ) $(MONITOR_SKEL_H) $(MONITOR_LOG_BIN) $(RANSOMWARE_LOG_BIN)
 	rm -f $(SRC_VMLINUX_H)
 	rm -f $(VMLINUX_H)
 
