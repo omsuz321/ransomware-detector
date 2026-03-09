@@ -1,0 +1,880 @@
+#!/bin/bash
+
+# ============================================================
+# BENIGN EVALUATION HARNESS
+# Runs benign workloads (copy/compress/fio) with monitor logging
+# ============================================================
+
+set -euo pipefail
+
+# --- GLOBAL STATE ---
+CURRENT_MONITOR_SCRIPT_DIR=""
+CURRENT_SERVER_PASS=""
+CURRENT_SERVER_IP=""
+CURRENT_LOCAL_WORKLOAD_PID=""
+CURRENT_CSV_POLLER_PID=""
+CURRENT_CSV_STATUS_FILE=""
+
+# --- PARAMETER ---
+SERVER_IP="${1:-}"
+CLIENT_MOUNT="${2:-/mnt/nfs}"
+DURATION="${3:-60}"
+SERVER_PASS="${4:-}"
+WORKLOAD_TYPE="${5:-}"      # copy | compress | fio
+WORKLOAD_ARG="${6:-}"       # copy: local source path, compress: source file/dir, fio: opendir/path
+REPEAT_COUNT="${7:-1}"
+RANSOMWARE_SCRIPT_DIR="${8:-/home/server/Desktop/dev/scripts}"
+
+SSH_OPTS=(
+    -o StrictHostKeyChecking=no
+    -o LogLevel=ERROR
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=2
+)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_DIR="$SCRIPT_DIR/../results"
+
+resolve_client_paths() {
+    # CLIENT_MOUNT mapping:
+    # - If /tmp exists in path, extract up to and including /tmp
+    # - .../target -> sibling .../tmp
+    # - else -> append /tmp
+    if [[ "${CLIENT_MOUNT}" == */tmp* ]]; then
+        CLIENT_TMP="${CLIENT_MOUNT%%/tmp*}/tmp"  # Extract everything before /tmp, then add /tmp
+    elif [ "$(basename "${CLIENT_MOUNT%/}")" = "target" ]; then
+        CLIENT_TMP="$(dirname "${CLIENT_MOUNT%/}")/tmp"
+    else
+        CLIENT_TMP="${CLIENT_MOUNT%/}/tmp"
+    fi
+
+    # Resolve matching target path on client side.
+    # If /target is already in path, use it as-is; if /tmp/something, extract base and use sibling /target
+    if [[ "${CLIENT_MOUNT}" == */target* ]]; then
+        CLIENT_TARGET="${CLIENT_MOUNT%/}"
+    elif [[ "${CLIENT_MOUNT}" == */tmp/* ]]; then
+        # e.g., /mnt/nfs/tmp/all -> /mnt/nfs/target
+        CLIENT_TARGET="${CLIENT_MOUNT%%/tmp*}/target"
+    elif [ "$(basename "${CLIENT_MOUNT%/}")" = "tmp" ]; then
+        CLIENT_TARGET="$(dirname "${CLIENT_MOUNT%/}")/target"
+    else
+        CLIENT_TARGET="${CLIENT_MOUNT%/}/target"
+    fi
+}
+
+resolve_client_paths
+
+SERVER_BASE_DIR="/srv/nfs/thesis_data"
+SERVER_SOURCE_DIR="$SERVER_BASE_DIR/target"
+SERVER_WORK_DIR="$SERVER_BASE_DIR/tmp"
+
+RANSOMWARE_MONITOR_CSV="/home/server/Desktop/run_evaluation.csv"
+EVENT_LABEL="benign"
+FIO_ALLOW_FILE_CREATE="${FIO_ALLOW_FILE_CREATE:-0}"  # Allow override via environment variable
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info()    { echo -e " [INFO] $1"; }
+log_success() { echo -e " [OK]   ${GREEN}$1${NC}"; }
+log_error()   { echo -e " [ERR]  ${RED}$1${NC}"; }
+log_warn()    { echo -e " [WARN] ${YELLOW}$1${NC}"; }
+
+sanitize_token() {
+    local raw="$1"
+    local normalized
+    normalized="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/_/g; s/^_+//; s/_+$//; s/_+/_/g')"
+    if [ -z "$normalized" ]; then
+        normalized="unknown"
+    fi
+    echo "$normalized"
+}
+
+generate_run_id() {
+    local workload="$1"
+    local repeat="$2"
+    local ts_ns
+
+    ts_ns="$(date +%s%N 2>/dev/null || true)"
+    if ! [[ "$ts_ns" =~ ^[0-9]+$ ]]; then
+        ts_ns="$(date +%s)$RANDOM"
+    fi
+
+    printf '%s_rep%03d_%s_%04d' "$workload" "$repeat" "$ts_ns" "$RANDOM"
+}
+
+normalize_subpath() {
+    local sub="${1:-all}"
+    sub="${sub#/}"
+    sub="${sub%/}"
+    if [ -z "$sub" ]; then
+        sub="all"
+    fi
+    echo "$sub"
+}
+
+resolve_compress_source_path() {
+    local source_arg="${1:-all}"
+    local resolved_path
+
+    if [[ "$source_arg" = /* ]]; then
+        if [[ "$source_arg" == "$CLIENT_TMP"* ]]; then
+            resolved_path="$SERVER_WORK_DIR${source_arg#"$CLIENT_TMP"}"
+        elif [[ "$source_arg" == "$CLIENT_TARGET"* ]]; then
+            resolved_path="$SERVER_SOURCE_DIR${source_arg#"$CLIENT_TARGET"}"
+        else
+            resolved_path="$source_arg"
+        fi
+    elif [ "$source_arg" = "all" ]; then
+        resolved_path="$SERVER_WORK_DIR/all"
+    else
+        source_arg="$(normalize_subpath "$source_arg")"
+        resolved_path="$SERVER_WORK_DIR/$source_arg"
+    fi
+
+    echo "$resolved_path"
+}
+
+stop_remote_monitor_best_effort() {
+    if [ -n "$CURRENT_MONITOR_SCRIPT_DIR" ] && [ -n "$CURRENT_SERVER_PASS" ] && [ -n "$CURRENT_SERVER_IP" ]; then
+        sshpass -p "$CURRENT_SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$CURRENT_SERVER_IP" \
+            "cd '$CURRENT_MONITOR_SCRIPT_DIR' && printf '%s\n' '$CURRENT_SERVER_PASS' | sudo -S -p '' bash ./ransomware_monitor.sh stop" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+kill_local_workload_best_effort() {
+    if [ -n "${CURRENT_LOCAL_WORKLOAD_PID:-}" ] && kill -0 "$CURRENT_LOCAL_WORKLOAD_PID" 2>/dev/null; then
+        kill -TERM -- "-$CURRENT_LOCAL_WORKLOAD_PID" 2>/dev/null || kill -TERM "$CURRENT_LOCAL_WORKLOAD_PID" 2>/dev/null || true
+        sleep 0.2
+        kill -KILL -- "-$CURRENT_LOCAL_WORKLOAD_PID" 2>/dev/null || kill -KILL "$CURRENT_LOCAL_WORKLOAD_PID" 2>/dev/null || true
+        wait "$CURRENT_LOCAL_WORKLOAD_PID" 2>/dev/null || true
+    fi
+    CURRENT_LOCAL_WORKLOAD_PID=""
+}
+
+stop_csv_poller_best_effort() {
+    if [ -n "${CURRENT_CSV_POLLER_PID:-}" ] && kill -0 "$CURRENT_CSV_POLLER_PID" 2>/dev/null; then
+        kill "$CURRENT_CSV_POLLER_PID" 2>/dev/null || true
+        wait "$CURRENT_CSV_POLLER_PID" 2>/dev/null || true
+    fi
+    CURRENT_CSV_POLLER_PID=""
+    CURRENT_CSV_STATUS_FILE=""
+}
+
+start_csv_poller() {
+    local run_id="$1"
+    local status_file="$2"
+
+    : > "$status_file"
+    CURRENT_CSV_STATUS_FILE="$status_file"
+
+    (
+        local last_line=""
+        while true; do
+            local csv_line
+            local detected
+            local detected_at
+
+            csv_line="$(sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" \
+                "grep '^$run_id,' '$RANSOMWARE_MONITOR_CSV' 2>/dev/null | tail -1" 2>/dev/null || true)"
+
+            if [ -n "$csv_line" ] && [ "$csv_line" != "$last_line" ]; then
+                last_line="$csv_line"
+                detected="$(echo "$csv_line" | cut -d',' -f5)"
+                detected_at="$(echo "$csv_line" | cut -d',' -f6)"
+
+                if [ "$detected" = "1" ]; then
+                    echo "1" > "$status_file"
+                    log_warn "Live-CSV: run_id=$run_id DETECTED=1 at $detected_at - stopping workload"
+                    # Kill the local workload process immediately
+                    kill_local_workload_best_effort
+                else
+                    echo "0" > "$status_file"
+                    log_info "Live-CSV: run_id=$run_id entry found (detected=$detected)"
+                fi
+            fi
+
+            sleep 1
+        done
+    ) &
+
+    CURRENT_CSV_POLLER_PID=$!
+}
+
+cleanup() {
+    echo -e "\n\n${YELLOW}Interrupt detected - cleaning up...${NC}"
+    stop_csv_poller_best_effort
+    kill_local_workload_best_effort
+    stop_remote_monitor_best_effort
+    echo -e "${YELLOW}Cleanup done - exit${NC}"
+    exit 130
+}
+
+trap cleanup SIGINT SIGTERM
+
+usage() {
+    echo "Usage:"
+    echo "  $0 SERVER_IP CLIENT_MOUNT DURATION SERVER_PASS WORKLOAD_TYPE [WORKLOAD_ARG] [REPEAT_COUNT] [MONITOR_SCRIPT_DIR]"
+    echo ""
+    echo "WORKLOAD_TYPE:"
+    echo "  copy     WORKLOAD_ARG=local source path to copy"
+    echo "  compress WORKLOAD_ARG=source file/dir on client to archive into CLIENT_TMP (default: all)"
+    echo "  fio      fixed fio profile; WORKLOAD_ARG defines opendir (target|all|<abs_dir>|<tmp_subpath>)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 192.168.2.209 /mnt/nfs/target 300 1234 copy /home/cleint/Documents 5"
+    echo "  $0 192.168.2.209 /mnt/nfs/target 300 1234 compress all 3"
+    echo "  $0 192.168.2.209 /mnt/nfs/target 300 1234 compress /mnt/nfs/tmp/all 1"
+    echo "  $0 192.168.2.209 /mnt/nfs/target 600 1234 fio target 2"
+    echo "  $0 192.168.2.209 /mnt/nfs/target 600 1234 fio /mnt/nfs/target/all 2"
+    echo "  $0 192.168.2.209 /mnt/nfs/target 600 1234 fio all 2"
+}
+
+test_ssh_connection() {
+    local server_ip="$1"
+    local server_pass="$2"
+    
+    log_info "Testing SSH connection to server@$server_ip (timeout: 10s)..."
+    
+    if ! command -v sshpass >/dev/null 2>&1; then
+        log_warn "sshpass is not installed. Install: sudo apt-get install sshpass"
+        return 1
+    fi
+    
+    local test_output
+    test_output=$(timeout 10 sshpass -p "$server_pass" ssh "${SSH_OPTS[@]}" "server@$server_ip" "echo OK" 2>&1)
+    local rc=$?
+    
+    if [ "$rc" -eq 124 ]; then
+        log_warn "SSH connection timeout (10s)"
+        return 1
+    fi
+    
+    if [ "$test_output" = "OK" ]; then
+        log_success "SSH connection OK"
+        return 0
+    else
+        log_warn "SSH connection failed"
+        log_info "Output: $test_output"
+        return 1
+    fi
+}
+
+if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PASS" ] || [ -z "$WORKLOAD_TYPE" ]; then
+    log_error "Missing required parameters."
+    usage
+    exit 1
+fi
+
+WORKLOAD_TYPE="$(sanitize_token "$WORKLOAD_TYPE")"
+if [[ "$WORKLOAD_TYPE" != "copy" && "$WORKLOAD_TYPE" != "compress" && "$WORKLOAD_TYPE" != "fio" ]]; then
+    log_error "Invalid WORKLOAD_TYPE: $WORKLOAD_TYPE"
+    usage
+    exit 1
+fi
+
+# Convenience parsing for fio:
+# - If arg6 is a path (starts with / or is target/all), use it as WORKLOAD_ARG
+# - If arg6 is numeric, treat it as REPEAT_COUNT, use default target
+if [ "$WORKLOAD_TYPE" = "fio" ]; then
+    if [ -z "$WORKLOAD_ARG" ]; then
+        WORKLOAD_ARG="target"
+    elif [[ "$WORKLOAD_ARG" =~ ^[0-9]+$ ]]; then
+        # Numeric arg6 means: arg6=repeat_count, arg7=repeat_count from original
+        REPEAT_COUNT="$WORKLOAD_ARG"
+        WORKLOAD_ARG="target"
+    fi
+    # Otherwise WORKLOAD_ARG is kept as-is (could be path, target, all, or subpath)
+fi
+
+# Auto-derive CLIENT_MOUNT from absolute workload path (e.g. /mnt/nfs/tmp/all)
+# so user doesn't need to pass the same mount path twice.
+if [[ "${WORKLOAD_ARG:-}" = /* ]] && ([[ "${WORKLOAD_ARG}" == */tmp* ]] || [[ "${WORKLOAD_ARG}" == */target* ]]); then
+    CLIENT_MOUNT="$WORKLOAD_ARG"
+    resolve_client_paths
+fi
+
+if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || [ "$DURATION" -le 0 ]; then
+    log_error "DURATION must be a positive integer."
+    exit 1
+fi
+
+if ! [[ "$REPEAT_COUNT" =~ ^[0-9]+$ ]] || [ "$REPEAT_COUNT" -le 0 ]; then
+    log_error "REPEAT_COUNT must be a positive integer."
+    exit 1
+fi
+
+if [ "$WORKLOAD_TYPE" = "copy" ] && [ -z "$WORKLOAD_ARG" ]; then
+    log_error "copy workload requires WORKLOAD_ARG as local source path."
+    usage
+    exit 1
+fi
+
+if [ ! -d "$CLIENT_TMP" ]; then
+    log_error "CLIENT_TMP not visible: $CLIENT_TMP"
+    exit 1
+fi
+
+setup_server_tmp() {
+    local label="$1"
+    log_info "Prepare server workdir (label: $label)"
+
+    sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" 'bash -s' <<EOF
+set -euo pipefail
+SERVER_PASS="$SERVER_PASS"
+SOURCE_DIR="$SERVER_SOURCE_DIR"
+WORK_DIR="$SERVER_WORK_DIR"
+
+printf '%s\n' "\$SERVER_PASS" | sudo -S -p '' mkdir -p "\$WORK_DIR"
+for i in 1 2 3; do
+    printf '%s\n' "\$SERVER_PASS" | sudo -S -p '' rm -rf "\$WORK_DIR"/* 2>/dev/null && break || sleep 1
+done
+
+if [ ! -d "\$SOURCE_DIR" ]; then
+    echo "ERROR: SOURCE_DIR missing: \$SOURCE_DIR"
+    exit 1
+fi
+
+printf '%s\n' "\$SERVER_PASS" | sudo -S -p '' cp -a "\$SOURCE_DIR"/* "\$WORK_DIR"/
+
+FILE_COUNT=\$(find "\$WORK_DIR" -mindepth 1 | wc -l)
+if [ "\$FILE_COUNT" -eq 0 ]; then
+    echo "ERROR: WORK_DIR empty after copy"
+    exit 1
+fi
+
+printf '%s\n' "\$SERVER_PASS" | sudo -S -p '' chown -R nobody:nogroup "\$WORK_DIR" 2>/dev/null || true
+printf '%s\n' "\$SERVER_PASS" | sudo -S -p '' chmod -R 777 "\$WORK_DIR" 2>/dev/null || true
+if [ -n "\$(find "\$WORK_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    printf '%s\n' "\$SERVER_PASS" | sudo -S -p '' bash -c 'cd "\$1" && chmod -R 777 ./*' _ "\$WORK_DIR" 2>/dev/null || true
+fi
+
+echo "OK:server_ready:\$FILE_COUNT"
+EOF
+}
+
+remote_server_path_has_entries() {
+    local path="$1"
+    sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" \
+        "[ -d '$path' ] && [ -n \"\$(find '$path' -mindepth 1 -print -quit 2>/dev/null)\" ]" \
+        >/dev/null 2>&1
+}
+
+start_monitor() {
+    local label="$1"
+    local run_id="$2"
+    local ssh_output
+
+    log_info "Starting monitor on server $SERVER_IP..."
+    log_info "  Script dir: $RANSOMWARE_SCRIPT_DIR"
+    log_info "  CSV path: $RANSOMWARE_MONITOR_CSV"
+    log_info "  Run ID: $run_id"
+
+    ssh_output=$(timeout 15 sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" bash -s "$SERVER_PASS" "$RANSOMWARE_SCRIPT_DIR" "$RANSOMWARE_MONITOR_CSV" "$run_id" "$label" <<'SSHEOF'
+set -euo pipefail
+SERVER_PASS="$1"
+SCRIPT_DIR="$2"
+CSV_PATH="$3"
+RUN_ID="$4"
+LABEL="$5"
+
+if [ ! -d "$SCRIPT_DIR" ]; then
+    echo "ERROR: monitor dir missing: $SCRIPT_DIR"
+    exit 1
+fi
+if [ ! -f "$SCRIPT_DIR/ransomware_monitor.sh" ]; then
+    echo "ERROR: ransomware_monitor.sh missing in $SCRIPT_DIR"
+    exit 1
+fi
+
+cd "$SCRIPT_DIR"
+printf '%s\n' "$SERVER_PASS" | sudo -S -p '' bash ./ransomware_monitor.sh run-bg \
+    -o "$CSV_PATH" \
+    --run-id "$RUN_ID" \
+    --label "$LABEL" >/dev/null 2>&1
+
+sleep 2
+PID=$(printf '%s\n' "$SERVER_PASS" | sudo -S -p '' cat /tmp/ransomware_logger.pid 2>/dev/null || echo "")
+if [ -z "$PID" ] || ! [[ "$PID" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: monitor pid missing/invalid"
+    exit 1
+fi
+
+echo "OK:$PID"
+SSHEOF
+2>&1)
+
+    echo "$ssh_output"
+}
+
+stop_monitor() {
+    sshpass -p "$SERVER_PASS" ssh "${SSH_OPTS[@]}" "server@$SERVER_IP" bash -s "$SERVER_PASS" "$RANSOMWARE_MONITOR_CSV" "$RANSOMWARE_SCRIPT_DIR" <<'SSHEOF' 2>&1 || true
+set -euo pipefail
+SERVER_PASS="$1"
+CSV_PATH="$2"
+SCRIPT_DIR="$3"
+
+if [ ! -f "$CSV_PATH" ]; then
+    echo "ERROR: CSV missing: $CSV_PATH"
+    exit 1
+fi
+
+cd "$SCRIPT_DIR" || { echo "ERROR: could not cd to $SCRIPT_DIR"; exit 1; }
+printf '%s\n' "$SERVER_PASS" | sudo -S -p '' bash ./ransomware_monitor.sh stop >/dev/null 2>&1 || true
+
+sleep 1
+LAST_LINE=$(printf '%s\n' "$SERVER_PASS" | sudo -S -p '' tail -1 "$CSV_PATH" 2>/dev/null || echo "")
+if [ -z "$LAST_LINE" ]; then
+    echo "ERROR: CSV has no data: $CSV_PATH"
+    exit 1
+fi
+
+echo "OK:$LAST_LINE"
+SSHEOF
+}
+
+run_copy_workload() {
+    local source_path="$1"
+    local run_id="$2"
+    local target_path="$CLIENT_TMP/benign_copy_$run_id"
+    local rc=0
+
+    if [ ! -e "$source_path" ]; then
+        log_error "copy source path missing: $source_path"
+        return 1
+    fi
+
+    mkdir -p "$target_path"
+    log_info "copy workload: $source_path -> $target_path (duration: ${DURATION}s)"
+
+    # Define copy command separately for clarity
+    local copy_cmd=(
+        timeout "${DURATION}s"
+        bash -s -- "$source_path" "$target_path"
+    )
+
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "${copy_cmd[@]}" <<'EOCPY' >/dev/null 2>&1 &
+set -euo pipefail
+SRC="$1"
+DST="$2"
+while true; do
+    if [ -d "$SRC" ]; then
+        cp -a "$SRC"/. "$DST"/
+    else
+        cp -a "$SRC" "$DST"/
+    fi
+done
+EOCPY
+    else
+        "${copy_cmd[@]}" <<'EOCPY' >/dev/null 2>&1 &
+set -euo pipefail
+SRC="$1"
+DST="$2"
+while true; do
+    if [ -d "$SRC" ]; then
+        cp -a "$SRC"/. "$DST"/
+    else
+        cp -a "$SRC" "$DST"/
+    fi
+done
+EOCPY
+    fi
+
+    CURRENT_LOCAL_WORKLOAD_PID=$!
+    wait "$CURRENT_LOCAL_WORKLOAD_PID" || rc=$?
+    rc="${rc:-0}"
+    CURRENT_LOCAL_WORKLOAD_PID=""
+
+    # timeout returns 124 when duration is reached; SIGTERM returns 143
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ]; then
+        log_error "copy workload failed with rc=$rc"
+        return 1
+    fi
+
+    log_success "copy workload finished"
+    return 0
+}
+
+run_compress_workload() {
+    local source_arg
+    local run_id="$2"
+    local rc=0
+    source_arg="${1:-all}"
+
+    # Source path on client (via NFS mount)
+    local client_source_path
+    if [[ "$source_arg" = /* ]]; then
+        # Absolute path
+        client_source_path="$source_arg"
+    elif [ "$source_arg" = "all" ]; then
+        # Try tmp/all first, then target/all
+        if [ -d "$CLIENT_TMP/all" ]; then
+            client_source_path="$CLIENT_TMP/all"
+        elif [ -d "$CLIENT_TARGET/all" ]; then
+            client_source_path="$CLIENT_TARGET/all"
+        else
+            log_error "compress source not found: tried $CLIENT_TMP/all and $CLIENT_TARGET/all"
+            return 1
+        fi
+    else
+        # Relative path
+        source_arg="$(normalize_subpath "$source_arg")"
+        if [ -d "$CLIENT_TMP/$source_arg" ]; then
+            client_source_path="$CLIENT_TMP/$source_arg"
+        elif [ -d "$CLIENT_TARGET/$source_arg" ]; then
+            client_source_path="$CLIENT_TARGET/$source_arg"
+        else
+            log_error "compress source not found: tried $CLIENT_TMP/$source_arg and $CLIENT_TARGET/$source_arg"
+            return 1
+        fi
+    fi
+    
+    log_info "compress source on client: $client_source_path (duration: ${DURATION}s)"
+    log_info "archive output dir on client: $CLIENT_TMP"
+
+    # Run compress workload locally on client
+    local archive_path
+    local iter=0
+    local end_time=$((SECONDS + DURATION))
+
+    while [ "$SECONDS" -lt "$end_time" ]; do
+        archive_path="$CLIENT_TMP/benign_compress_${run_id}_${iter}.tar"
+
+        if [ "$iter" -gt 0 ]; then
+            rm -f "$CLIENT_TMP/benign_compress_${run_id}_$((iter - 1)).tar" 2>/dev/null || true
+        fi
+
+        log_info "[iter $iter] Creating archive: $(basename "$archive_path")"
+        
+        tar -cf "$archive_path" -C "$(dirname "$client_source_path")" "$(basename "$client_source_path")" 2>&1 | grep -v "^Removing leading" || true
+
+        if [ -f "$archive_path" ]; then
+            local size=$(du -h "$archive_path" | cut -f1)
+            log_info "[iter $iter] Created (size: $size)"
+        else
+            log_error "Failed to create archive"
+            return 1
+        fi
+
+        iter=$((iter + 1))
+    done
+
+    if [ "$iter" -eq 0 ]; then
+        log_error "compress workload created no archives"
+        return 1
+    fi
+
+    log_success "Compress workload finished ($iter iterations)"
+    log_info "Archives stored on client: $CLIENT_TMP/benign_compress_${run_id}_*.tar"
+    return 0
+
+run_fio_workload() {
+    local fio_arg
+    local run_id="$2"
+    local target_path=""
+    local out_file="/tmp/benign_fio_${run_id}.txt"
+    local rc=0
+
+    # Use passed arg, or default to target
+    if [ -n "${1:-}" ]; then
+        fio_arg="$1"
+    else
+        fio_arg="target"
+    fi
+
+    if ! command -v fio >/dev/null 2>&1; then
+        log_error "fio is not installed on client"
+        return 1
+    fi
+
+    # Resolve opendir from workload argument.
+    # Priority: absolute path (with fallback) > target > all > subpath
+    if [[ "$fio_arg" = /* ]]; then
+        target_path="$fio_arg"
+        
+        # If absolute path doesn't exist, try to find it in CLIENT_TARGET instead
+        if [ ! -d "$target_path" ]; then
+            # Extract relative part after CLIENT_TMP prefix
+            if [[ "$target_path" == "$CLIENT_TMP"/* ]]; then
+                local relative_part="${target_path#$CLIENT_TMP/}"
+                target_path="$CLIENT_TARGET/$relative_part"
+                
+                if [ ! -d "$target_path" ]; then
+                    log_error "fio path not found: $fio_arg (tried $CLIENT_TARGET/$relative_part too)"
+                    return 1
+                fi
+                log_info "fio workload on client: fallback to target dir $target_path (runtime: ${DURATION}s)"
+            else
+                log_error "fio absolute path does not exist: $fio_arg"
+                return 1
+            fi
+        else
+            log_info "fio workload on client: absolute path $target_path (runtime: ${DURATION}s)"
+        fi
+    elif [ "$fio_arg" = "target" ]; then
+        target_path="$CLIENT_TARGET"
+        log_info "fio workload on client: target dir $target_path (runtime: ${DURATION}s)"
+    elif [ "$fio_arg" = "all" ]; then
+        target_path="$CLIENT_TMP/all"
+        # Fallback to target/all if tmp/all doesn't exist
+        if [ ! -d "$target_path" ]; then
+            target_path="$CLIENT_TARGET/all"
+            log_info "fio workload on client: fallback to target/all (runtime: ${DURATION}s)"
+        else
+            log_info "fio workload on client: all subdir $target_path (runtime: ${DURATION}s)"
+        fi
+    else
+        fio_arg="$(normalize_subpath "$fio_arg")"
+        target_path="$CLIENT_TMP/$fio_arg"
+        # Fallback to target if tmp doesn't work
+        if [ ! -d "$target_path" ]; then
+            target_path="$CLIENT_TARGET/$fio_arg"
+            log_info "fio workload on client: fallback to target/$fio_arg (runtime: ${DURATION}s)"
+        else
+            log_info "fio workload on client: tmp subpath $target_path (runtime: ${DURATION}s)"
+        fi
+    fi
+
+    if [ ! -d "$target_path" ]; then
+        log_error "fio target path missing: $target_path"
+        return 1
+    fi
+
+    # Clean output files before running
+    rm -f "$out_file" 2>/dev/null || true
+
+    # FIO command with separate parameters for clarity
+    local fio_cmd=(
+        fio
+        --name=rw67_c33
+        --directory="$target_path"
+        --rw=randrw
+        --rwmixread=67
+        --buffer_compress_percentage=33
+        --bsrange=4k-32k
+        --runtime="$DURATION"
+        --time_based
+        --overwrite=1
+        --size=10G
+        --output="$out_file"
+    )
+    
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "${fio_cmd[@]}" >/dev/null 2>&1 &
+    else
+        "${fio_cmd[@]}" >/dev/null 2>&1 &
+    fi
+
+    CURRENT_LOCAL_WORKLOAD_PID=$!
+    wait "$CURRENT_LOCAL_WORKLOAD_PID" || rc=$?
+    CURRENT_LOCAL_WORKLOAD_PID=""
+    
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 143 ] && [ "$rc" -ne 15 ]; then
+        # 143 = SIGTERM, 15 = SIGTERM - expected when killed due to detection
+        log_error "fio workload failed with rc=$rc"
+        return 1
+    fi
+    
+    # Display fio output if available
+    if [ -f "$out_file" ]; then
+        log_success "FIO Results for run $run_id:"
+        cat "$out_file" | sed 's/^/    /'
+        rm -f "$out_file"
+    fi
+
+    log_success "fio workload finished"
+    return 0
+}
+
+run_selected_workload() {
+    local run_id="$1"
+    case "$WORKLOAD_TYPE" in
+        copy)
+            run_copy_workload "$WORKLOAD_ARG" "$run_id"
+            ;;
+        compress)
+            run_compress_workload "${WORKLOAD_ARG:-all}" "$run_id"
+            ;;
+        fio)
+            run_fio_workload "${WORKLOAD_ARG:-all}" "$run_id"
+            ;;
+        *)
+            log_error "Unsupported workload type: $WORKLOAD_TYPE"
+            return 1
+            ;;
+    esac
+}
+
+main() {
+    mkdir -p "$RESULTS_DIR"
+
+    echo -e "\n${BLUE}============================================${NC}"
+    echo -e "${BLUE} BENIGN Evaluation Harness${NC}"
+    echo -e "${BLUE}============================================${NC}\n"
+    log_info "WORKLOAD_TYPE=$WORKLOAD_TYPE"
+    log_info "WORKLOAD_ARG=$WORKLOAD_ARG"
+    log_info "CLIENT_MOUNT=$CLIENT_MOUNT -> CLIENT_TMP=$CLIENT_TMP, CLIENT_TARGET=$CLIENT_TARGET"
+    log_info "DURATION=${DURATION}s, REPEAT_COUNT=$REPEAT_COUNT"
+    log_info "LABEL=$EVENT_LABEL"
+    
+    # Test SSH connection first
+    log_info ""
+    log_info "=== PRE-FLIGHT CHECKS ==="
+    if ! test_ssh_connection "$SERVER_IP" "$SERVER_PASS"; then
+        log_warn "SSH connection test FAILED - monitor will not work"
+        log_warn "But FIO on client will still run. Continuing..."
+    else
+        log_success "SSH connection OK"
+    fi
+    log_info ""
+
+    local repeat
+    for repeat in $(seq 1 "$REPEAT_COUNT"); do
+        local run_id
+        local setup_output
+        local setup_done=0
+        local monitor_output
+        local workload_rc=0
+        local final_result
+
+        run_id="$(generate_run_id "$WORKLOAD_TYPE" "$repeat")"
+        echo -e "\n${YELLOW}---- Run $repeat/$REPEAT_COUNT (${WORKLOAD_TYPE}) ----${NC}"
+        log_info "Run-ID: $run_id"
+
+        # Setup depends on workload type
+        if [ "$WORKLOAD_TYPE" = "copy" ]; then
+            if setup_output="$(setup_server_tmp "$WORKLOAD_TYPE" 2>&1)"; then
+                setup_done=1
+            else
+                log_error "Server setup failed"
+                echo "$setup_output" | sed 's/^/  /'
+                continue
+            fi
+
+            if [ "$setup_done" -eq 1 ]; then
+                log_success "Server setup done"
+            fi
+        elif [ "$WORKLOAD_TYPE" = "compress" ]; then
+            # Compress setup: nothing needed - runs locally on client
+            log_info "compress workload: will run on client (no server setup needed)"
+            setup_done=1
+        else
+            log_info "fio workload: skipping server setup (using existing files)"
+        fi
+
+        CURRENT_SERVER_IP="$SERVER_IP"
+        CURRENT_SERVER_PASS="$SERVER_PASS"
+        CURRENT_MONITOR_SCRIPT_DIR="$RANSOMWARE_SCRIPT_DIR"
+
+        log_info "Attempting to start monitor on server..."
+        monitor_output="$(start_monitor "$EVENT_LABEL" "$run_id" 2>&1)"
+        
+        if echo "$monitor_output" | grep -q '^ERROR:\|^timeout:\|Timeout'; then
+            log_error "Monitor start failed!"
+            log_error "Output:"
+            echo "$monitor_output" | sed 's/^/  /'
+            log_error "Check:"
+            log_error "  - SSH password correct?"
+            log_error "  - Directory exists? $RANSOMWARE_SCRIPT_DIR"
+            log_error "  - File exists? $RANSOMWARE_SCRIPT_DIR/ransomware_monitor.sh"
+            log_error "Skipping server-side monitoring, FIO will run locally only"
+            CURRENT_SERVER_IP=""
+            CURRENT_SERVER_PASS=""
+            CURRENT_MONITOR_SCRIPT_DIR=""
+        elif echo "$monitor_output" | grep -q '^ERROR:'; then
+            log_error "Monitor start failed"
+            echo "$monitor_output" | sed 's/^/  /'
+            CURRENT_SERVER_IP=""
+            CURRENT_SERVER_PASS=""
+            CURRENT_MONITOR_SCRIPT_DIR=""
+            continue
+        else
+            local monitor_ok_line
+            local monitor_pid
+            monitor_ok_line="$(echo "$monitor_output" | grep '^OK:' | tail -1)"
+            if [ -z "$monitor_ok_line" ]; then
+                log_warn "Monitor start returned no OK line - will run FIO without monitoring"
+                log_info "Debug output: $(echo "$monitor_output" | head -1)"
+                CURRENT_SERVER_IP=""
+                CURRENT_SERVER_PASS=""
+                CURRENT_MONITOR_SCRIPT_DIR=""
+                # Continue with local FIO only
+            else
+                monitor_pid="${monitor_ok_line#OK:}"
+                log_success "Monitor started (PID: $monitor_pid)"
+            fi
+        fi
+
+        local detection_flag_file="/tmp/benign_detect_${run_id}.flag"
+        
+        # Skip CSV poller if monitor is not running
+        if [ -n "$CURRENT_SERVER_IP" ]; then
+            start_csv_poller "$run_id" "$detection_flag_file"
+        fi
+        
+        log_info "Starting workload..."
+        run_selected_workload "$run_id" || workload_rc=$?
+        
+        stop_csv_poller_best_effort
+
+        if [ -f "$detection_flag_file" ] && grep -q '^1$' "$detection_flag_file" 2>/dev/null; then
+            log_warn "Ransomware DETECTED during run '$run_id' - workload terminated early"
+        else
+            log_info "No ransomware detected during run '$run_id'"
+        fi
+        rm -f "$detection_flag_file" 2>/dev/null || true
+
+        # Only try to stop monitor if it was started
+        if [ -n "$CURRENT_SERVER_IP" ]; then
+            final_result="$(stop_monitor)"
+            CURRENT_SERVER_IP=""
+            CURRENT_SERVER_PASS=""
+            CURRENT_MONITOR_SCRIPT_DIR=""
+            
+            if [ "$workload_rc" -ne 0 ]; then
+                log_warn "Workload exited with rc=$workload_rc"
+            fi
+
+            if [[ "$final_result" != OK:* ]]; then
+                log_warn "Could not fetch monitor results"
+                echo "$final_result" | sed 's/^/  /'
+                continue
+            fi
+
+            local csv_line
+            local csv_run_id
+            local csv_label
+            csv_line="${final_result#OK:}"
+            csv_run_id="$(echo "$csv_line" | cut -d',' -f1)"
+            csv_label="$(echo "$csv_line" | cut -d',' -f2)"
+
+            if [ "$csv_run_id" != "$run_id" ]; then
+                log_warn "CSV run_id mismatch: expected '$run_id', got '$csv_run_id'"
+            fi
+            if [ "$csv_label" != "$EVENT_LABEL" ]; then
+                log_warn "CSV label mismatch: expected '$EVENT_LABEL', got '$csv_label'"
+            fi
+
+            echo "$csv_line" >> "$RESULTS_DIR/benign_evaluation_results.csv"
+            log_success "Saved result: $csv_line"
+        else
+            log_info "Monitor was not started - skipping result collection"
+        fi
+
+        if [ "$repeat" -lt "$REPEAT_COUNT" ]; then
+            sleep 2
+        fi
+    done
+
+    echo -e "\n${GREEN}Done.${NC}"
+    log_info "Results: $RESULTS_DIR/benign_evaluation_results.csv"
+}
+
+main "$@"

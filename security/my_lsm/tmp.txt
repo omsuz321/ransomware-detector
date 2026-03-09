@@ -15,3 +15,114 @@ sudo scripts/ransomware_monitor.sh stop
 /srv/nfs/thesis_data *(rw,sync,no_subtree_check,no_root_squash,all_squash,anonuid=65534,anongid=65534,insecure)
 sudo exportfs -ra
 sudo systemctl restart nfs-kernel-server
+
+
+# Copy (lokaler Quellpfad muss existieren)
+sudo bash /work/scripts/client/bechtest/run_benign_evaluation.sh \
+  192.168.2.209 /mnt/nfs/target 300 1234 copy /home/cleint/Documents 5
+
+# Compress (Subpfad unter tmp, z.B. all)
+sudo bash /work/scripts/client/bechtest/run_benign_evaluation.sh \
+  192.168.2.209 /mnt/nfs/target 300 1234 compress all 3
+
+# FIO (Subpfad unter tmp)
+sudo bash /work/scripts/client/bechtest/run_benign_evaluation.sh \
+  192.168.2.209 /mnt/nfs/target 600 1234 fio all 2
+
+sudo bash run_benign_evaluation.sh 192.168.2.209 /mnt/nfs/tmp/all 600 1234 fio /mnt/nfs/tmp/all 5
+
+
+fio --name=rw67_c33 --directory=/mnt/nfs/tmp/all \
+  --rw=randrw --rwmixread=67 \
+  --buffer_compress_percentage=33 \
+  --bsrange=4k-32k \
+  --runtime=600 --time_based --overwrite=1 --size=10G
+
+  sudo bash run_benign_evaluation.sh 192.168.2.209 /mnt/nfs/tmp/all 300 1234 compress all 1
+
+
+sudo bash run_benign_evaluation.sh 192.168.2.209 /mnt/nfs 300 1234 compress test_data 3
+
+cd /work/scripts/client/bechtest
+
+./run_overhead_evaluation.sh \
+    192.168.2.209 \
+    /mnt/nfs \
+    1 \
+    <SERVER_PASS> \
+    /home/server/Desktop/dev/scripts \
+    500M \
+    randrw
+
+    sshpass -p 1234 ssh server@192.168.2.209 "sudo ls -l /tmp/pidstat_*run1.log /tmp/pidstat_*.pid; echo '---'; sudo tail -50 /tmp/pidstat_nfsd_baseline_run1.log; echo '---'; sudo tail -50 /tmp/pidstat_nfsd_detector_run1.log; echo '---'; sudo tail -50 /tmp/pidstat_detector_run1.log"
+
+
+    # 1. Schaue ob Detector-Prozess läuft
+ps aux | grep -i ransom | grep -v grep
+
+# 2. Schaue nach eBPF-Kompilierungs-Logs
+tail -100 /tmp/ransomware_logger.bg.log 2>/dev/null || echo "Kein Log gefunden"
+
+# 3. Schaue nach PID-Datei
+ls -la /tmp/ransomware_logger.pid
+
+# 4. Wenn PID-Datei existiert, zeige den Inhalt
+cat /tmp/ransomware_logger.pid 2>/dev/null || echo "Keine PID-Datei"
+
+# 5. Suche nach allen ransomware-Dateien
+find /tmp -name "*ransomware*" -type f 2>/dev/null | head -20
+
+# 6. Versuche den Detector manuell zu starten und schaue die Ausgabe
+cd /home/server/Desktop/dev/scripts
+sudo bash ./ransomware_monitor.sh run-bg -o /tmp/test_run.csv --run-id manual_test --label debug_test
+sleep 3
+
+# 7. Sofort danach schaue nach der PID
+cat /tmp/ransomware_logger.pid 2>/dev/null || echo "Immer noch keine PID"
+
+# 8. Schaue nach dem Prozess
+sleep 2
+ps aux | grep -i ransom | grep -v grep
+
+
+
+
+
+
+
+
+
+bash -lc '
+echo "=== CLIENT VM ==="
+echo "HOSTNAME=$(hostname)"
+echo
+echo "--- OS ---"
+cat /etc/os-release
+echo "KERNEL=$(uname -r)"
+echo
+echo "--- VM / CPU / RAM / DISK ---"
+systemd-detect-virt 2>/dev/null || true
+hostnamectl 2>/dev/null || true
+echo
+lscpu | egrep "Model name|Socket|Core|Thread|CPU\\(s\\)|Hypervisor vendor|Virtualization" || true
+echo
+free -h
+echo
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
+echo
+echo "--- NETWORK ---"
+ip -brief addr
+echo
+echo "--- NFS CLIENT ---"
+mount | grep nfs || true
+echo
+systemctl status nfs-client.target --no-pager 2>/dev/null | sed -n "1,12p" || true
+echo
+echo "--- OPTIONAL WORKLOAD TOOLS ---"
+which fio 2>/dev/null || true
+fio --version 2>/dev/null || true
+which openssl 2>/dev/null || true
+openssl version 2>/dev/null || true
+which rsync 2>/dev/null || true
+rsync --version 2>/dev/null | head -n 1 || true
+'

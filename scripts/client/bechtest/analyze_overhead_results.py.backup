@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""
+Reproducible Analysis Script for NFS Ransomware Detector Overhead Evaluation
+
+This script analyzes results from run_overhead_evaluation.sh and allows
+full reproducibility by re-parsing raw data (FIO JSON, pidstat logs).
+
+Usage:
+    python3 analyze_overhead_results.py <results.csv>
+    python3 analyze_overhead_results.py <raw_data_directory>
+    python3 analyze_overhead_results.py <results.csv> --reparse
+    python3 analyze_overhead_results.py <results.csv> --detailed
+    python3 analyze_overhead_results.py <raw_data_directory> --export-csv output.csv
+
+Options:
+    --reparse       Re-parse raw data (FIO JSON + pidstat logs) instead of using CSV
+    --detailed      Show detailed per-run statistics
+    --export-plots  Generate matplotlib plots (requires matplotlib)
+    --export-csv    Export parsed data to CSV file (when using raw_data directory)
+    --help          Show this help message
+"""
+
+import csv
+import json
+import sys
+import os
+import statistics
+import re
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def parse_pidstat_log(log_path: str) -> Tuple[float, int]:
+    """
+    Parse pidstat log file and extract average CPU percentage.
+    
+    Returns:
+        (avg_cpu_percent, sample_count)
+    """
+    if not os.path.exists(log_path):
+        return (0.0, 0)
+    
+    cpu_values = []
+    
+    with open(log_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 7:
+                continue
+            
+            # Find %CPU column (usually 3rd from end)
+            try:
+                cpu_val = float(parts[-3])
+                if 0 <= cpu_val <= 100:
+                    cpu_values.append(cpu_val)
+            except (ValueError, IndexError):
+                continue
+    
+    if not cpu_values:
+        return (0.0, 0)
+    
+    return (statistics.mean(cpu_values), len(cpu_values))
+
+
+def parse_fio_json(json_path: str) -> Dict:
+    """
+    Parse FIO JSON output and extract relevant metrics.
+    
+    Returns:
+        dict with keys: runtime_sec, bw_kbps, iops, lat_ns
+    """
+    if not os.path.exists(json_path):
+        return {}
+    
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    
+    job = data.get('jobs', [{}])[0]
+    
+    # Determine if read or write workload
+    read_data = job.get('read', {})
+    write_data = job.get('write', {})
+    
+    # Use whichever has more data
+    if read_data.get('io_bytes', 0) > write_data.get('io_bytes', 0):
+        io_data = read_data
+        io_type = 'read'
+    else:
+        io_data = write_data
+        io_type = 'write'
+    
+    return {
+        'runtime_sec': job.get('job_runtime', 0) / 1000.0,
+        'bw_kbps': io_data.get('bw', 0),
+        'iops': io_data.get('iops', 0),
+        'lat_ns': io_data.get('lat_ns', {}).get('mean', 0),
+        'io_type': io_type,
+        'total_io_mb': io_data.get('io_bytes', 0) / (1024 * 1024)
+    }
+
+
+def reparse_raw_data(raw_data_dir: str) -> List[Dict]:
+    """
+    Re-parse all raw data (FIO JSON + pidstat logs) to reconstruct results.
+    This allows full reproducibility independent of the original script's parsing.
+    
+    Args:
+        raw_data_dir: Path to raw_data directory (or CSV path, will auto-detect)
+    """
+    # If CSV path given, construct raw_data_dir path
+    if raw_data_dir.endswith('.csv'):
+        csv_dir = os.path.dirname(raw_data_dir)
+        csv_basename = os.path.splitext(os.path.basename(raw_data_dir))[0]
+        raw_data_dir = os.path.join(csv_dir, f"raw_data_{csv_basename}")
+    
+    if not os.path.exists(raw_data_dir):
+        print(f"Error: Raw data directory not found: {raw_data_dir}")
+        sys.exit(1)
+    
+    if not os.path.isdir(raw_data_dir):
+        print(f"Error: Not a directory: {raw_data_dir}")
+        sys.exit(1)
+    
+    print(f"Re-parsing raw data from: {raw_data_dir}")
+    
+    results = []
+    
+    # Find all FIO JSON files
+    fio_files = sorted(Path(raw_data_dir).glob("fio_*.json"))
+    
+    if not fio_files:
+        print(f"Error: No FIO JSON files found in {raw_data_dir}")
+        print(f"Expected files like: fio_baseline_run1.json, fio_detector_run1.json")
+        sys.exit(1)
+    
+    print(f"Found {len(fio_files)} FIO result files")
+    
+    for fio_file in fio_files:
+        # Extract mode and run_num from filename: fio_baseline_run1.json
+        match = re.match(r'fio_(baseline|detector)_run(\d+)\.json', fio_file.name)
+        if not match:
+            print(f"Warning: Skipping unrecognized file: {fio_file.name}")
+            continue
+        
+        mode = match.group(1)
+        run_num = int(match.group(2))
+        
+        # Parse FIO data
+        fio_data = parse_fio_json(str(fio_file))
+        
+        # Parse nfsd pidstat log
+        nfsd_log = os.path.join(raw_data_dir, f"pidstat_nfsd_{mode}_run{run_num}.log")
+        nfsd_cpu, nfsd_samples = parse_pidstat_log(nfsd_log)
+        
+        # Parse detector pidstat log (only for detector mode)
+        detector_cpu = 0.0
+        detector_samples = 0
+        if mode == 'detector':
+            detector_log = os.path.join(raw_data_dir, f"pidstat_detector_run{run_num}.log")
+            detector_cpu, detector_samples = parse_pidstat_log(detector_log)
+        
+        results.append({
+            'mode': mode,
+            'run_num': run_num,
+            'fio_runtime_sec': fio_data.get('runtime_sec', 0),
+            'fio_bw_kbps': fio_data.get('bw_kbps', 0),
+            'fio_iops': fio_data.get('iops', 0),
+            'fio_lat_ns': fio_data.get('lat_ns', 0),
+            'nfsd_avg_cpu_pct': nfsd_cpu,
+            'nfsd_samples': nfsd_samples,
+            'detector_avg_cpu_pct': detector_cpu,
+            'detector_samples': detector_samples,
+            'raw_source': 'reparsed'
+        })
+    
+    # Sort by mode and run_num
+    results.sort(key=lambda x: (x['mode'], x['run_num']))
+    
+    print(f"Successfully parsed {len(results)} runs")
+    print(f"  - Baseline: {len([r for r in results if r['mode'] == 'baseline'])} runs")
+    print(f"  - Detector: {len([r for r in results if r['mode'] == 'detector'])} runs")
+    
+    return results
+
+
+def load_csv_results(csv_path: str) -> List[Dict]:
+    """Load results from CSV file."""
+    results = []
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Convert numeric fields
+            row['run_num'] = int(row['run_num'])
+            row['fio_runtime_sec'] = float(row['fio_runtime_sec'])
+            row['fio_bw_kbps'] = float(row['fio_bw_kbps'])
+            row['nfsd_avg_cpu_pct'] = float(row['nfsd_avg_cpu_pct'])
+            row['detector_avg_cpu_pct'] = float(row['detector_avg_cpu_pct'])
+            row['raw_source'] = 'csv'
+            results.append(row)
+    return results
+
+
+# ============================================================================
+# ANALYSIS FUNCTIONS
+# ============================================================================
+
+def calculate_statistics(values: List[float]) -> Dict:
+    """Calculate statistical measures for a list of values."""
+    if not values:
+        return {
+            'mean': 0, 'median': 0, 'std': 0,
+            'min': 0, 'max': 0, 'p25': 0, 'p75': 0
+        }
+    
+    return {
+        'mean': statistics.mean(values),
+        'median': statistics.median(values),
+        'std': statistics.stdev(values) if len(values) > 1 else 0,
+        'min': min(values),
+        'max': max(values),
+        'p25': statistics.quantiles(values, n=4)[0] if len(values) >= 4 else min(values),
+        'p75': statistics.quantiles(values, n=4)[2] if len(values) >= 4 else max(values)
+    }
+
+
+def analyze_results(results: List[Dict], detailed: bool = False) -> None:
+    """Perform comprehensive analysis of overhead results."""
+    
+    # Split by mode
+    baseline = [r for r in results if r['mode'] == 'baseline']
+    detector = [r for r in results if r['mode'] == 'detector']
+    
+    if not baseline or not detector:
+        print("Error: Missing baseline or detector runs")
+        sys.exit(1)
+    
+    print("\n" + "=" * 70)
+    print(" OVERHEAD EVALUATION ANALYSIS")
+    print("=" * 70)
+    print(f"\nDataset: {len(baseline)} baseline runs, {len(detector)} detector runs")
+    
+    # Runtime analysis
+    baseline_times = [r['fio_runtime_sec'] for r in baseline]
+    detector_times = [r['fio_runtime_sec'] for r in detector]
+    
+    baseline_stats = calculate_statistics(baseline_times)
+    detector_stats = calculate_statistics(detector_times)
+    
+    time_overhead_pct = ((detector_stats['median'] - baseline_stats['median']) 
+                         / baseline_stats['median'] * 100)
+    
+    print("\n--- RUNTIME PERFORMANCE ---")
+    print(f"Baseline:  {baseline_stats['median']:.3f}s (median), "
+          f"{baseline_stats['std']:.3f}s (std), "
+          f"[{baseline_stats['min']:.3f}-{baseline_stats['max']:.3f}]")
+    print(f"Detector:  {detector_stats['median']:.3f}s (median), "
+          f"{detector_stats['std']:.3f}s (std), "
+          f"[{detector_stats['min']:.3f}-{detector_stats['max']:.3f}]")
+    print(f"Overhead:  {time_overhead_pct:+.2f}%")
+    
+    # Bandwidth analysis
+    baseline_bw = [r['fio_bw_kbps'] for r in baseline]
+    detector_bw = [r['fio_bw_kbps'] for r in detector]
+    
+    baseline_bw_stats = calculate_statistics(baseline_bw)
+    detector_bw_stats = calculate_statistics(detector_bw)
+    
+    bw_overhead_pct = ((baseline_bw_stats['median'] - detector_bw_stats['median'])
+                       / baseline_bw_stats['median'] * 100)
+    
+    print("\n--- BANDWIDTH ---")
+    print(f"Baseline:  {baseline_bw_stats['median']:.0f} KB/s (median), "
+          f"{baseline_bw_stats['std']:.0f} KB/s (std)")
+    print(f"Detector:  {detector_bw_stats['median']:.0f} KB/s (median), "
+          f"{detector_bw_stats['std']:.0f} KB/s (std)")
+    print(f"Reduction: {bw_overhead_pct:+.2f}%")
+    
+    # CPU analysis
+    baseline_cpu = [r['nfsd_avg_cpu_pct'] for r in baseline]
+    detector_cpu_nfsd = [r['nfsd_avg_cpu_pct'] for r in detector]
+    detector_cpu_det = [r['detector_avg_cpu_pct'] for r in detector]
+    
+    baseline_cpu_stats = calculate_statistics(baseline_cpu)
+    detector_cpu_nfsd_stats = calculate_statistics(detector_cpu_nfsd)
+    detector_cpu_det_stats = calculate_statistics(detector_cpu_det)
+    
+    cpu_overhead_pct = detector_cpu_nfsd_stats['median'] - baseline_cpu_stats['median']
+    
+    print("\n--- CPU USAGE ---")
+    print(f"Baseline nfsd:    {baseline_cpu_stats['median']:.2f}% (median), "
+          f"{baseline_cpu_stats['std']:.2f}% (std)")
+    print(f"Detector nfsd:    {detector_cpu_nfsd_stats['median']:.2f}% (median), "
+          f"{detector_cpu_nfsd_stats['std']:.2f}% (std)")
+    print(f"Detector monitor: {detector_cpu_det_stats['median']:.2f}% (median), "
+          f"{detector_cpu_det_stats['std']:.2f}% (std)")
+    print(f"nfsd overhead:    {cpu_overhead_pct:+.2f}%")
+    print(f"Total CPU added:  {detector_cpu_det_stats['median']:.2f}%")
+    
+    # Detailed per-run breakdown
+    if detailed:
+        print("\n--- DETAILED PER-RUN RESULTS ---")
+        print("\nBaseline:")
+        print(f"{'Run':<5} {'Runtime(s)':<12} {'BW(KB/s)':<10} {'nfsd CPU%':<10}")
+        for r in baseline:
+            print(f"{r['run_num']:<5} {r['fio_runtime_sec']:<12.3f} "
+                  f"{r['fio_bw_kbps']:<10.0f} {r['nfsd_avg_cpu_pct']:<10.2f}")
+        
+        print("\nDetector:")
+        print(f"{'Run':<5} {'Runtime(s)':<12} {'BW(KB/s)':<10} "
+              f"{'nfsd CPU%':<10} {'det CPU%':<10}")
+        for r in detector:
+            print(f"{r['run_num']:<5} {r['fio_runtime_sec']:<12.3f} "
+                  f"{r['fio_bw_kbps']:<10.0f} {r['nfsd_avg_cpu_pct']:<10.2f} "
+                  f"{r['detector_avg_cpu_pct']:<10.2f}")
+    
+    print("\n" + "=" * 70)
+    print("\nSUMMARY:")
+    print(f"  Time overhead:  {time_overhead_pct:+.2f}%")
+    print(f"  CPU overhead:   {cpu_overhead_pct:+.2f}% (nfsd) + "
+          f"{detector_cpu_det_stats['median']:.2f}% (detector)")
+    print(f"  BW reduction:   {bw_overhead_pct:+.2f}%")
+    print("=" * 70 + "\n")
+
+
+def export_plots(results: List[Dict], output_dir: str) -> None:
+    """Generate matplotlib plots for visual analysis."""
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("Error: matplotlib not installed. Install with: pip install matplotlib")
+        return
+    
+    baseline = [r for r in results if r['mode'] == 'baseline']
+    detector = [r for r in results if r['mode'] == 'detector']
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Runtime comparison
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    baseline_times = [r['fio_runtime_sec'] for r in baseline]
+    detector_times = [r['fio_runtime_sec'] for r in detector]
+    
+    ax.boxplot([baseline_times, detector_times], labels=['Baseline', 'Detector'])
+    ax.set_ylabel('Runtime (seconds)')
+    ax.set_title('FIO Runtime: Baseline vs. Detector')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'runtime_comparison.png'), dpi=300)
+    print(f"Saved: {output_dir}/runtime_comparison.png")
+    
+    # CPU comparison
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    baseline_cpu = [r['nfsd_avg_cpu_pct'] for r in baseline]
+    detector_cpu_nfsd = [r['nfsd_avg_cpu_pct'] for r in detector]
+    detector_cpu_det = [r['detector_avg_cpu_pct'] for r in detector]
+    
+    x = np.arange(3)
+    width = 0.6
+    
+    medians = [
+        statistics.median(baseline_cpu),
+        statistics.median(detector_cpu_nfsd),
+        statistics.median(detector_cpu_det)
+    ]
+    
+    ax.bar(x, medians, width, color=['blue', 'orange', 'green'])
+    ax.set_xticks(x)
+    ax.set_xticklabels(['Baseline\nnfsd', 'Detector\nnfsd', 'Detector\nmonitor'])
+    ax.set_ylabel('CPU Usage (%)')
+    ax.set_title('CPU Usage Comparison')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'cpu_comparison.png'), dpi=300)
+    print(f"Saved: {output_dir}/cpu_comparison.png")
+    
+    plt.close('all')
+
+
+def export_to_csv(results: List[Dict], output_path: str) -> None:
+    """Export parsed results to CSV file."""
+    if not results:
+        print("Error: No results to export")
+        return
+    
+    # Define CSV columns
+    fieldnames = [
+        'mode', 'run_num', 'fio_runtime_sec', 'fio_bw_kbps',
+        'nfsd_avg_cpu_pct', 'detector_avg_cpu_pct',
+        'nfsd_samples', 'detector_samples',
+        'fio_iops', 'fio_lat_ns'
+    ]
+    
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for r in results:
+            # Write only the fields we want
+            row = {k: r.get(k, 0) for k in fieldnames}
+            writer.writerow(row)
+    
+    print(f"\n✓ Exported results to: {output_path}")
+    print(f"  {len(results)} runs written to CSV")
+
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    if len(sys.argv) < 2 or '--help' in sys.argv:
+        print(__doc__)
+        sys.exit(0)
+    
+    input_path = sys.argv[1]
+    
+    if not os.path.exists(input_path):
+        print(f"Error: Path not found: {input_path}")
+        sys.exit(1)
+    
+    # Parse command line options
+    reparse = '--reparse' in sys.argv
+    detailed = '--detailed' in sys.argv
+    export_plots_flag = '--export-plots' in sys.argv
+    
+    # Check for --export-csv option
+    export_csv_path = None
+    if '--export-csv' in sys.argv:
+        try:
+            idx = sys.argv.index('--export-csv')
+            if idx + 1 < len(sys.argv):
+                export_csv_path = sys.argv[idx + 1]
+            else:
+                print("Error: --export-csv requires a filename argument")
+                sys.exit(1)
+        except ValueError:
+            pass
+    
+    # Determine if input is a directory or CSV file
+    is_directory = os.path.isdir(input_path)
+    
+    # Load data
+    if is_directory:
+        print(f"Input is a directory, parsing raw data...")
+        results = reparse_raw_data(input_path)
+        
+        # Auto-generate CSV filename if not specified
+        if export_csv_path is None:
+            dir_basename = os.path.basename(input_path.rstrip('/'))
+            # Remove 'raw_data_' prefix if present
+            if dir_basename.startswith('raw_data_'):
+                csv_basename = dir_basename[9:] + '_reparsed.csv'
+            else:
+                csv_basename = dir_basename + '_reparsed.csv'
+            export_csv_path = os.path.join(os.path.dirname(input_path) or '.', csv_basename)
+        
+        # Export to CSV
+        export_to_csv(results, export_csv_path)
+        print("")
+        
+    elif reparse:
+        print("Re-parsing raw data for full reproducibility...")
+        results = reparse_raw_data(input_path)
+    else:
+        results = load_csv_results(input_path)
+    
+    # Analyze
+    analyze_results(results, detailed=detailed)
+    
+    # Export plots if requested
+    if export_plots_flag:
+        if is_directory:
+            output_dir = os.path.join(input_path, 'plots')
+        else:
+            output_dir = os.path.join(os.path.dirname(input_path), 'plots')
+        export_plots(results, output_dir)
+
+
+if __name__ == '__main__':
+    main()
